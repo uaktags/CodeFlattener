@@ -6,6 +6,8 @@ name: Release CI
 on:
   push:
     branches: [ main, master ]
+    tags:
+	- 'v*'
   pull_request:
     branches: [ main, master ]
   # This allows you to run the workflow manually from the Actions tab on GitHub.
