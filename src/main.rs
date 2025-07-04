@@ -8,12 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use tiktoken_rs::p50k_base;
 
-// --- Profile Definitions ---
-// Using once_cell::sync::Lazy for safe, one-time static initialization.
-// This is the Rust equivalent of defining a global constant dictionary in Python.
+// Lazily initialized static map of predefined profiles. `once_cell` ensures thread-safe, one-time creation.
 static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
     let mut m = HashMap::new();
     m.insert(
@@ -43,7 +41,16 @@ static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
             allowed_filenames: &["CMakeLists.txt"],
         },
     );
-    // Add other profiles here following the same pattern...
+    m.insert(
+        "rust",
+        Profile {
+            description: "Rust project files.",
+            allowed_extensions: &[
+                ".rs", ".toml", ".md", ".yml", ".yaml", ".sh", ".json", ".html",
+            ],
+            allowed_filenames: &["Cargo.toml", "Cargo.lock", "build.rs", ".rustfmt.toml"],
+        },
+    );
     m
 });
 
@@ -54,9 +61,6 @@ struct Profile {
     allowed_filenames: &'static [&'static str],
 }
 
-// --- CLI Argument Parsing using `clap` ---
-// `clap` with the `derive` feature lets us define our CLI arguments as a struct.
-// It's strongly typed and automatically generates help messages.
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -81,11 +85,11 @@ struct Args {
     #[arg(long)]
     list_profiles: bool,
 
-    /// Comma-separated or space-separated list of allowed file extensions.
+    /// Comma-separated list of allowed file extensions (overrides profile).
     #[arg(short, long, value_delimiter = ',', use_value_delimiter = true)]
     extensions: Option<Vec<String>>,
 
-    /// Space-separated list of specific filenames to include regardless of extension.
+    /// Space-separated list of specific filenames to include (overrides profile).
     #[arg(short, long, value_delimiter = ' ')]
     allowed_filenames: Option<Vec<String>>,
 
@@ -118,14 +122,15 @@ struct Args {
     verbose: bool,
 }
 
-// An enum for clap to create a choice of profiles from our HashMap keys.
+// clap uses this enum to derive the possible values for the `--profile` argument.
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
 enum ProfileChoice {
     #[clap(name = "nextjs-ts-prisma")]
     NextjsTsPrisma,
     #[clap(name = "cpp-cmake")]
     CppCmake,
-    // Add other profile names here
+    #[clap(name = "rust")]
+    Rust,
 }
 
 fn main() -> Result<()> {
@@ -136,14 +141,15 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // --- Resolve Configuration (Profile + Overrides) ---
     let mut extensions: HashSet<String> = HashSet::new();
     let mut allowed_filenames: HashSet<String> = HashSet::new();
 
+    // Load settings from a profile if one was chosen.
     if let Some(profile_choice) = &args.profile {
         let profile_key = match profile_choice {
             ProfileChoice::NextjsTsPrisma => "nextjs-ts-prisma",
             ProfileChoice::CppCmake => "cpp-cmake",
+            ProfileChoice::Rust => "rust",
         };
         if let Some(profile) = PROFILES.get(profile_key) {
             if args.verbose {
@@ -154,7 +160,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Apply command-line overrides
+    // Command-line arguments override any profile settings.
     if let Some(exts) = args.extensions {
         extensions = exts
             .into_iter()
@@ -172,10 +178,9 @@ fn main() -> Result<()> {
     }
 
     if extensions.is_empty() && allowed_filenames.is_empty() {
-        anyhow::bail!("Error: No allowed extensions or filenames specified. Use a profile or --extensions.");
+        anyhow::bail!("Error: No allowed extensions or filenames specified. Use a profile or provide them via flags.");
     }
 
-    // --- Start Processing ---
     let mut all_contents = String::new();
     let mut file_count = 0;
     let max_file_size = (args.max_size * 1024.0 * 1024.0) as u64;
@@ -189,8 +194,7 @@ fn main() -> Result<()> {
     println!("Max File Size: {:.2} MB", args.max_size);
 
     for start_dir in &args.target_dirs {
-        // `ignore` crate respects .gitignore, .ignore, etc. by default.
-        // It's much more efficient and practical than `os.walk`.
+        // Use the `ignore` crate to recursively walk directories. It's fast and automatically respects .gitignore files.
         let walker = WalkBuilder::new(start_dir).build();
         for result in walker {
             let entry = match result {
@@ -249,8 +253,9 @@ fn main() -> Result<()> {
                                 }
                             }
                             Err(e) => {
+                                // A common reason for failure is trying to read a non-UTF8 file.
                                 eprintln!(
-                                    "Warning: Could not read file {}: {} (maybe not UTF-8?)",
+                                    "Warning: Could not read file {}: {} (skipping)",
                                     path.display(),
                                     e
                                 );
@@ -265,50 +270,46 @@ fn main() -> Result<()> {
         }
     }
 
-    // --- Append Git Changes ---
     if args.include_git_changes {
-        let git_root = find_git_root(args.target_dirs.get(0).unwrap_or(&PathBuf::from(".")))?;
-        if let Some(root) = git_root {
-            let git_output = get_git_changes(
+        if let Ok(Some(root)) = find_git_root(args.target_dirs.get(0).unwrap_or(&PathBuf::from("."))) {
+            if let Ok(Some(git_output)) = get_git_changes(
                 &root,
                 !args.no_staged_diff,
                 !args.no_unstaged_diff,
                 args.verbose,
-            )?;
-            if let Some(output) = git_output {
-                all_contents.push_str(&output);
+            ) {
+                all_contents.push_str(&git_output);
             }
         } else if args.verbose {
-            eprintln!("Warning: Git repository not found for any target directory.");
+            eprintln!("Warning: Git repository not found in target directories.");
         }
     }
 
-
-    // --- Tokenization and Summary ---
     let token_count = if args.gpt4_tokens {
-        let bpe = p50k_base().unwrap(); // Using a common tokenizer, change if needed
-        bpe.encode_with_special_tokens(&all_contents).len()
+        // p50k_base is a sensible default for GPT-3.5/4.
+        p50k_base().unwrap().encode_with_special_tokens(&all_contents).len()
     } else {
-        all_contents.split_whitespace().count() // Simple whitespace split
+        all_contents.split_whitespace().count()
     };
 
-    // --- Output ---
     if let Some(output_path) = args.output {
-        let parent = output_path.parent().unwrap();
-        if !parent.exists() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+        if let Some(parent) = output_path.parent() {
+             if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create output directory: {}", parent.display()))?;
+            }
         }
         fs::write(&output_path, &all_contents)
             .with_context(|| format!("Failed to write to output file: {}", output_path.display()))?;
         println!("\nFlattened code written to: {}", output_path.display());
     } else {
-        // Using io::stdout().lock() is more performant for large outputs.
+        // Lock stdout for a performance gain when writing large amounts of data.
         let mut stdout = io::stdout().lock();
         write!(stdout, "{}", all_contents)?;
     }
     
-    // Final summary printed to stderr to not interfere with stdout piping
+    // Print the final summary to stderr to avoid mixing it with the primary output,
+    // which allows for clean piping (e.g., `flattener | pbcopy`).
     eprintln!("\n--- Processing Complete ---");
     eprintln!("Total files processed: {}", file_count);
     eprintln!("Approximate token count: {}", token_count);
@@ -328,6 +329,7 @@ fn list_profiles() {
     }
 }
 
+/// Traverses up from `start_path` to find the repository root (containing a `.git` directory).
 fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
     let mut current_path = fs::canonicalize(start_path)
         .with_context(|| format!("Failed to find canonical path for {}", start_path.display()))?;
@@ -337,11 +339,13 @@ fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
             return Ok(Some(current_path));
         }
         if !current_path.pop() {
+            // Reached the filesystem root without finding a .git directory.
             return Ok(None);
         }
     }
 }
 
+/// Executes git commands to get status and diffs, returning them as a formatted string.
 fn get_git_changes(
     git_repo_path: &Path,
     include_staged: bool,
@@ -352,7 +356,6 @@ fn get_git_changes(
     output.push_str("\n\n# --- Git Changes ---\n");
     output.push_str(&format!("# Repository: {}\n\n", git_repo_path.display()));
 
-    // Git Status
     let status_output = Command::new("git")
         .args(["status", "--porcelain", "-uall"])
         .current_dir(git_repo_path)
@@ -372,7 +375,6 @@ fn get_git_changes(
         eprintln!("'git status' failed: {}", String::from_utf8_lossy(&status_output.stderr));
     }
     
-    // Git Diff (Staged)
     if include_staged {
         let diff_output = Command::new("git")
             .args(["diff", "--staged"])
@@ -391,7 +393,6 @@ fn get_git_changes(
         }
     }
 
-    // Git Diff (Unstaged)
     if include_unstaged {
         let diff_output = Command::new("git")
             .args(["diff"])

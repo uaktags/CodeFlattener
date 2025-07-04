@@ -1,6 +1,6 @@
 [package]
-name = "code_flattener_rs"
-version = "0.1.0"
+name = "CodeFlattener"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
