@@ -24,16 +24,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl # Statically linked Linux binary
-            archive_name: code_flattener_rs-linux-x86_64.tar.gz
+            archive_name: code-flattener-linux-x86_64.tar.gz
           - os: macos-latest
             target: x86_64-apple-darwin # Intel Mac
-            archive_name: code_flattener_rs-macos-x86_64.tar.gz
+            archive_name: code-flattener-macos-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin # Apple Silicon Mac (M1/M2/M3)
-            archive_name: code_flattener_rs-macos-aarch64.tar.gz
+            archive_name: code-flattener-macos-aarch64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive_name: code_flattener_rs-windows-x86_64.zip
+            archive_name: code-flattener-windows-x86_64.zip
 
     # Use the operating system from the matrix.
     runs-on: ${{ matrix.os }}
@@ -70,9 +70,9 @@ jobs:
 
           # Determine binary name based on OS.
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp "$SOURCE_DIR/CodeFlattener.exe" "$STAGING_DIR/"
+            cp "$SOURCE_DIR/code-flattener.exe" "$STAGING_DIR/"
           else
-            cp "$SOURCE_DIR/CodeFlattener" "$STAGING_DIR/"
+            cp "$SOURCE_DIR/code-flattener" "$STAGING_DIR/"
           fi
           
           # Copy other useful files into the archive.
