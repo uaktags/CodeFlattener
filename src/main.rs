@@ -1,5 +1,8 @@
 // src/main.rs
 
+mod wordpress_profile;
+use wordpress_profile::WordPressProfilePlugin;
+
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use glob::Pattern;
@@ -257,6 +260,8 @@ enum ProfileChoice {
     CppCmake,
     #[clap(name = "rust")]
     Rust,
+    #[clap(name = "wordpress")]
+    WordPress,
 }
 
 #[derive(Debug)]
@@ -750,6 +755,7 @@ fn load_profile_settings(
             ProfileChoice::NextjsTsPrisma => "nextjs-ts-prisma",
             ProfileChoice::CppCmake => "cpp-cmake",
             ProfileChoice::Rust => "rust",
+            ProfileChoice::WordPress => "wordpress",
         };
 
         if let Some(profile) = plugin.get_profile(profile_key) {
