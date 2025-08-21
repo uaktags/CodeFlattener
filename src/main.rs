@@ -743,12 +743,37 @@ fn output_results(result: &ProcessingResult, args: &Args) -> Result<()> {
     Ok(())
 }
 
+// CompositeProfilePlugin definition
+struct CompositeProfilePlugin {
+    default: DefaultProfilePlugin,
+    wordpress: WordPressProfilePlugin,
+}
+
+impl ProfilePlugin for CompositeProfilePlugin {
+    fn get_profile(&self, name: &str) -> Option<Profile> {
+        if name == "wordpress" {
+            self.wordpress.get_profile(name)
+        } else {
+            self.default.get_profile(name)
+        }
+    }
+
+    fn list_profiles(&self) -> Vec<String> {
+        let mut profiles = self.default.list_profiles();
+        profiles.extend(self.wordpress.list_profiles());
+        profiles
+    }
+}
+
 fn load_profile_settings(
     args: &Args,
     extensions: &mut HashSet<String>,
     allowed_filenames: &mut HashSet<String>,
 ) -> Result<()> {
-    let plugin: Box<dyn ProfilePlugin> = Box::new(DefaultProfilePlugin);
+    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin {
+        default: DefaultProfilePlugin,
+        wordpress: WordPressProfilePlugin,
+    });
 
     if let Some(profile_choice) = &args.profile {
         let profile_key = match profile_choice {
