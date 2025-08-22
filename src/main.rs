@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,41 @@ impl ProfilePlugin for DefaultProfilePlugin {
 
     fn list_profiles(&self) -> Vec<String> {
         PROFILES.keys().map(|s| s.to_string()).collect()
+    }
+}
+
+// Composite plugin that consults WordPress plugin first, then defaults
+struct CompositeProfilePlugin {
+    default: DefaultProfilePlugin,
+    wordpress: WordPressProfilePlugin,
+}
+
+impl CompositeProfilePlugin {
+    fn new() -> Self {
+        CompositeProfilePlugin {
+            default: DefaultProfilePlugin,
+            wordpress: WordPressProfilePlugin,
+        }
+    }
+}
+
+impl ProfilePlugin for CompositeProfilePlugin {
+    fn get_profile(&self, name: &str) -> Option<Profile> {
+        // Prefer wordpress plugin when asked, otherwise fall back to defaults
+        self.wordpress
+            .get_profile(name)
+            .or_else(|| self.default.get_profile(name))
+    }
+
+    fn list_profiles(&self) -> Vec<String> {
+        let mut profiles = self.default.list_profiles();
+        for p in self.wordpress.list_profiles() {
+            if !profiles.contains(&p) {
+                profiles.push(p);
+            }
+        }
+        profiles.sort();
+        profiles
     }
 }
 
@@ -250,6 +285,14 @@ struct Args {
     /// Show progress bar
     #[arg(long)]
     progress: bool,
+
+    /// Dry run: log which files would be processed but don't read them
+    #[arg(long)]
+    dry_run: bool,
+
+    /// WordPress-profile-specific: comma-separated list of plugin slugs to exclude (e.g. woocommerce,elementor-pro)
+    #[arg(long, value_delimiter = ',', use_value_delimiter = true)]
+    wp_exclude_plugins: Option<Vec<String>>,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -428,23 +471,28 @@ fn process_directories(args: &Args) -> Result<ProcessingResult> {
         }
     }
 
-    let mut git_output = String::new();
-    if args.include_git_changes {
-        if let Ok(Some(root)) =
-            find_git_root(args.target_dirs.first().unwrap_or(&PathBuf::from(".")))
-        {
-            if let Ok(Some(output)) = get_git_changes(
-                &root,
-                !args.no_staged_diff,
-                !args.no_unstaged_diff,
-                args.verbose,
-            ) {
-                git_output = output;
+    // If dry-run, do not fetch git diffs or assemble file contents.
+    // We still rely on process_single_file to have incremented file_count.
+    let content = if args.dry_run {
+        // Do not collect git changes or file contents in dry-run.
+        String::new()
+    } else {
+        let mut git_output = String::new();
+        if args.include_git_changes {
+            if let Ok(Some(root)) =
+                find_git_root(args.target_dirs.first().unwrap_or(&PathBuf::from(".")))
+            {
+                if let Ok(Some(output)) = get_git_changes(
+                    &root,
+                    !args.no_staged_diff,
+                    !args.no_unstaged_diff,
+                    args.verbose,
+                ) {
+                    git_output = output;
+                }
             }
         }
-    }
 
-    let content = {
         let mut content = all_contents.lock().unwrap().clone();
         content.push_str(&git_output);
         content
@@ -497,6 +545,13 @@ fn build_walker(start_dir: &Path, args: &Args) -> WalkBuilder {
                 .starts_with('.')
         });
     }
+
+    // Add WordPress-specific exclusions
+    walker.filter_entry(|entry| {
+        let path = entry.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        name != "wp-admin" && name != "wp-includes"
+    });
 
     walker
 }
@@ -564,6 +619,52 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
         }
     }
 
+    // WordPress-profile specific: exclude plugins specified via --wp-exclude-plugins
+    if let Some(excludes) = &args.wp_exclude_plugins {
+        if let Ok(rel) = path.strip_prefix(base_dir) {
+            // Normalize the relative path to lowercase for slug matching
+            let rel_str = rel.to_string_lossy().to_lowercase();
+            for raw in excludes {
+                // Normalize exclude entries (allow values like "woocommerce/packages/..." or "Woocommerce")
+                let slug = raw.split('/').next().unwrap_or(raw).to_lowercase();
+                let plugin_prefix = format!("wp-content/plugins/{}", slug);
+                if rel_str.starts_with(&plugin_prefix) {
+                    if args.verbose {
+                        info!("Excluding plugin '{}' path: {}", raw, rel.display());
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Check if file is binary (skip binary files)
+    if is_binary_file(path) {
+        return false;
+    }
+
+    // For WordPress profile, exclude common core WordPress files
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        let core_wp_files = [
+            "xmlrpc.php",
+            "wp-activate.php",
+            "wp-cron.php",
+            "wp-load.php",
+            "wp-blog-header.php",
+            "wp-settings.php",
+            "wp-login.php",
+            "wp-signup.php",
+            "wp-trackback.php",
+            "wp-comments-post.php",
+            "wp-links-opml.php",
+            "wp-mail.php",
+        ];
+
+        if core_wp_files.contains(&file_name) {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -592,6 +693,38 @@ fn load_ignore_patterns() -> Vec<Pattern> {
         }
     }
     patterns
+}
+
+fn is_binary_file(path: &Path) -> bool {
+    // Check file extension for known binary files
+    if let Some(ext) = path.extension() {
+        let ext_str = ext.to_string_lossy().to_lowercase();
+        let binary_extensions = [
+            "png", "jpg", "jpeg", "gif", "ico", "webp", "svg", "bmp", "tiff", "tif", "mp4", "avi",
+            "mov", "wmv", "flv", "webm", "mkv", "mp3", "wav", "ogg", "zip", "tar", "gz", "bz2",
+            "7z", "rar", "pdf", "doc", "docx", "xls", "xlsx", "exe", "dll", "so", "dylib", "woff",
+            "woff2", "ttf", "eot",
+        ];
+
+        if binary_extensions.contains(&ext_str.as_str()) {
+            return true;
+        }
+    }
+
+    // For files without extensions or unknown extensions, try to detect by reading first 1024 bytes
+    if let Ok(mut file) = fs::File::open(path) {
+        let mut buffer = [0u8; 1024];
+        if let Ok(bytes_read) = file.read(&mut buffer) {
+            // Check for null bytes or non-printable characters
+            for &byte in &buffer[..bytes_read] {
+                if byte == 0 || (byte < 32 && byte != 9 && byte != 10 && byte != 13) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 fn process_entries_parallel(
@@ -675,6 +808,15 @@ fn process_single_file(
         return Ok(());
     }
 
+    // For dry-run we want to avoid any file reads. Log a single "DRY-RUN" line and
+    // increment the counter. Do not attempt metadata or content access.
+    if args.dry_run {
+        info!("DRY-RUN: would process {}", path.display());
+        let mut count = file_count.lock().unwrap();
+        *count += 1;
+        return Ok(());
+    }
+
     let metadata = fs::metadata(path)
         .with_context(|| format!("Failed to get metadata for {}", path.display()))?;
 
@@ -743,37 +885,15 @@ fn output_results(result: &ProcessingResult, args: &Args) -> Result<()> {
     Ok(())
 }
 
-// CompositeProfilePlugin definition
-struct CompositeProfilePlugin {
-    default: DefaultProfilePlugin,
-    wordpress: WordPressProfilePlugin,
-}
-
-impl ProfilePlugin for CompositeProfilePlugin {
-    fn get_profile(&self, name: &str) -> Option<Profile> {
-        if name == "wordpress" {
-            self.wordpress.get_profile(name)
-        } else {
-            self.default.get_profile(name)
-        }
-    }
-
-    fn list_profiles(&self) -> Vec<String> {
-        let mut profiles = self.default.list_profiles();
-        profiles.extend(self.wordpress.list_profiles());
-        profiles
-    }
-}
+// ...existing code...
 
 fn load_profile_settings(
     args: &Args,
     extensions: &mut HashSet<String>,
     allowed_filenames: &mut HashSet<String>,
 ) -> Result<()> {
-    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin {
-        default: DefaultProfilePlugin,
-        wordpress: WordPressProfilePlugin,
-    });
+    // Default composite plugin for most profiles
+    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
 
     if let Some(profile_choice) = &args.profile {
         let profile_key = match profile_choice {
@@ -783,12 +903,48 @@ fn load_profile_settings(
             ProfileChoice::WordPress => "wordpress",
         };
 
-        if let Some(profile) = plugin.get_profile(profile_key) {
-            if args.verbose {
-                info!("Using '{}' profile.", profile_key);
+        // Special-case WordPress: prefer a path-aware profile that runs `wp` inside
+        // the target directory so active/inactive state reported by wp-cli is accurate.
+        if profile_key == "wordpress" {
+            // Use the first target directory as the WordPress site root
+            let wp_root = args
+                .target_dirs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| PathBuf::from("."));
+
+            // Directly use the concrete WordPress plugin implementation so we can
+            // call get_profile_for_path which invokes wp-cli with the correct cwd.
+            let wp_plugin = WordPressProfilePlugin;
+            if let Some(profile) = wp_plugin.get_profile_for_path(
+                "wordpress",
+                &wp_root,
+                args.wp_exclude_plugins.as_deref(),
+            ) {
+                if args.verbose {
+                    info!(
+                        "Using 'wordpress' profile (path-aware) at {}",
+                        wp_root.display()
+                    );
+                }
+                extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
+                allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
+            } else if let Some(profile) = plugin.get_profile(profile_key) {
+                // Fallback to the composite/default behavior if path-aware profile fails
+                if args.verbose {
+                    info!("Path-aware wordpress profile failed; falling back to default profile.");
+                }
+                extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
+                allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
             }
-            extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
-            allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
+        } else {
+            if let Some(profile) = plugin.get_profile(profile_key) {
+                if args.verbose {
+                    info!("Using '{}' profile.", profile_key);
+                }
+                extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
+                allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
+            }
         }
     }
 
@@ -819,7 +975,7 @@ fn load_profile_settings(
 }
 
 fn list_profiles() {
-    let plugin: Box<dyn ProfilePlugin> = Box::new(DefaultProfilePlugin);
+    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
     println!("Available Profiles:");
     for name in plugin.list_profiles() {
         if let Some(profile) = plugin.get_profile(&name) {
@@ -939,12 +1095,16 @@ fn is_safe_path(path: &Path, base_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use std::env;
 
     #[test]
     fn test_is_safe_path() {
-        let temp_dir = tempdir().unwrap();
-        let base_path = temp_dir.path();
+        let base_path = env::temp_dir();
+        // create a unique subdir for test
+        let temp_dir = base_path.join("codeflattener_test_tmp");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let base_path = temp_dir.as_path();
         let safe_path = base_path.join("subdir/file.txt");
         assert!(is_safe_path(&safe_path, base_path));
 
@@ -955,8 +1115,11 @@ mod tests {
 
     #[test]
     fn test_should_process_path() {
-        let temp_dir = tempdir().unwrap();
-        let base_path = temp_dir.path();
+        let base = env::temp_dir();
+        let temp_dir = base.join("codeflattener_test_tmp_2");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let base_path = temp_dir.as_path();
         let file_path = base_path.join("src/main.rs");
 
         fs::create_dir_all(base_path.join("src")).unwrap();
@@ -990,6 +1153,8 @@ mod tests {
             include_globs: None,
             parallel: false,
             progress: false,
+            dry_run: false,
+            wp_exclude_plugins: None,
         };
 
         assert!(should_process_path(&file_path, &args, base_path));
