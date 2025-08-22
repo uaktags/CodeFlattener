@@ -113,9 +113,51 @@ impl WordPressProfilePlugin {
         name: &str,
         wp_path: &std::path::Path,
         exclude_plugins: Option<&[String]>,
+        include_only_plugins: Option<&[String]>,
+        include_theme: Option<&str>,
     ) -> Option<Profile> {
         if name != "wordpress" {
             return None;
+        }
+
+        // If user is specifying exactly what to include, use a more permissive profile
+        // and let the directory filtering in `should_process_path` do the work.
+        if include_only_plugins.is_some() || include_theme.is_some() {
+            info!("Using explicit include profile for WordPress");
+            let allowed_extensions: Vec<&'static str> = vec![
+                ".php",
+                ".js",
+                ".css",
+                ".scss",
+                ".sass",
+                ".less",
+                ".html",
+                ".htm",
+                ".md",
+                ".mdx",
+                ".json",
+                ".xml",
+                ".yml",
+                ".yaml",
+                ".ini",
+                ".env",
+                ".env.local",
+                ".env.development",
+                ".env.production",
+                ".txt",
+            ];
+            let allowed_filenames: Vec<String> = vec!["wp-config.php".to_string()];
+
+            let allowed_filenames_leaked: Vec<&'static str> = allowed_filenames
+                .iter()
+                .map(|s| Box::leak(s.clone().into_boxed_str()) as &'static str)
+                .collect();
+
+            return Some(Profile {
+                description: "WordPress site with specific theme/plugins.",
+                allowed_extensions: Box::leak(allowed_extensions.into_boxed_slice()),
+                allowed_filenames: Box::leak(allowed_filenames_leaked.into_boxed_slice()),
+            });
         }
 
         // Build allowed filenames starting with wp-config.php
@@ -123,17 +165,24 @@ impl WordPressProfilePlugin {
 
         // Try to obtain active theme via wp-cli in the provided path
         info!("Running `wp theme list` in {}", wp_path.display());
-        let theme_path = if let Ok(output) = Command::new("wp")
-            .args(["theme", "list", "--format=json", "--status=active"])
-            .current_dir(wp_path)
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(themes) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
-                {
-                    if let Some(theme) = themes.first() {
-                        if let Some(theme_name) = theme.get("name").and_then(|n| n.as_str()) {
-                            Some(wp_path.join("wp-content/themes").join(theme_name))
+        let theme_path = if let Some(theme_name) = include_theme {
+            Some(wp_path.join("wp-content/themes").join(theme_name))
+        } else {
+            if let Ok(output) = Command::new("wp")
+                .args(["theme", "list", "--format=json", "--status=active"])
+                .current_dir(wp_path)
+                .output()
+            {
+                if output.status.success() {
+                    if let Ok(themes) =
+                        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+                    {
+                        if let Some(theme) = themes.first() {
+                            if let Some(theme_name) = theme.get("name").and_then(|n| n.as_str()) {
+                                Some(wp_path.join("wp-content/themes").join(theme_name))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -146,79 +195,90 @@ impl WordPressProfilePlugin {
             } else {
                 None
             }
-        } else {
-            None
-        }
-        .or_else(|| {
-            // Fallback to filesystem scanning rooted at wp_path
-            let themes_dir = wp_path.join("wp-content/themes");
-            if themes_dir.exists() {
-                if let Ok(mut themes) = self.get_available_themes() {
-                    // convert to absolute by joining
-                    themes.retain(|p| p.starts_with("wp-content") || p.is_absolute());
-                    // If available_themes returned relative names, return first
-                    themes.first().cloned()
+            .or_else(|| {
+                // Fallback to filesystem scanning rooted at wp_path
+                let themes_dir = wp_path.join("wp-content/themes");
+                if themes_dir.exists() {
+                    if let Ok(mut themes) = self.get_available_themes() {
+                        // convert to absolute by joining
+                        themes.retain(|p| p.starts_with("wp-content") || p.is_absolute());
+                        // If available_themes returned relative names, return first
+                        themes.first().cloned()
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
-            } else {
-                None
-            }
-        });
+            })
+        };
 
         // Try to obtain active plugins via wp-cli in the provided path
-        let plugin_paths = if let Ok(output) = Command::new("wp")
+        let mut plugin_paths = if let Ok(output) = Command::new("wp")
             .args(["plugin", "list", "--format=json", "--status=active"])
             .current_dir(wp_path)
             .output()
         {
-            // Log raw output (helps diagnose name formats like 'woocommerce/packages/...')
             info!("wp plugin list output ({} bytes)", output.stdout.len());
             if output.status.success() {
                 if let Ok(plugins) =
                     serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
                 {
-                    let mut plugin_paths = Vec::new();
-                    for plugin in plugins {
-                        if let Some(plugin_name) = plugin.get("name").and_then(|n| n.as_str()) {
-                            // Normalize to plugin slug (take first path component before any '/')
-                            let slug = plugin_name.split('/').next().unwrap_or(plugin_name);
-                            let slug_normalized = slug.to_lowercase();
-                            // Respect the exclude_plugins list if provided (case-insensitive)
-                            if let Some(excludes) = exclude_plugins {
-                                if excludes.iter().any(|e| e.to_lowercase() == slug_normalized) {
-                                    info!(
-                                        "Excluding plugin '{}' (slug {}) from profile",
-                                        plugin_name, slug
-                                    );
-                                    continue;
-                                }
-                            }
-                            plugin_paths.push(wp_path.join("wp-content/plugins").join(slug));
-                        }
-                    }
-                    plugin_paths
+                    plugins
+                        .iter()
+                        .filter_map(|p| {
+                            p.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
                 } else {
-                    // fall back to scanning plugin dir
-                    match self.get_available_plugins() {
-                        Ok(ps) => ps.into_iter().map(|p| wp_path.join(p)).collect(),
-                        Err(_) => Vec::new(),
-                    }
+                    Vec::new()
                 }
             } else {
-                // wp-cli command failed - fallback
-                match self.get_available_plugins() {
-                    Ok(ps) => ps.into_iter().map(|p| wp_path.join(p)).collect(),
-                    Err(_) => Vec::new(),
-                }
+                Vec::new()
             }
         } else {
-            // wp not present or failed - fallback to filesystem scanning
-            match self.get_available_plugins() {
-                Ok(ps) => ps.into_iter().map(|p| wp_path.join(p)).collect(),
-                Err(_) => Vec::new(),
-            }
+            Vec::new()
         };
+
+        // If wp-cli fails, fallback to filesystem scan
+        if plugin_paths.is_empty() {
+            if let Ok(available_plugins) = self.get_available_plugins() {
+                plugin_paths = available_plugins
+                    .iter()
+                    .filter_map(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect();
+            }
+        }
+
+        // Filter out excluded plugins
+        let final_plugin_paths: Vec<PathBuf> = plugin_paths
+            .iter()
+            .filter_map(|plugin_name| {
+                let slug = plugin_name.split('/').next().unwrap_or(plugin_name);
+                let slug_normalized = slug.to_lowercase();
+
+                if let Some(includes) = include_only_plugins {
+                    if !includes.iter().any(|e| e.to_lowercase() == slug_normalized) {
+                        return None;
+                    }
+                } else if let Some(excludes) = exclude_plugins {
+                    if excludes.iter().any(|e| e.to_lowercase() == slug_normalized) {
+                        info!(
+                            "Excluding plugin '{}' (slug {}) from profile",
+                            plugin_name, slug
+                        );
+                        return None;
+                    }
+                }
+                Some(wp_path.join("wp-content/plugins").join(slug))
+            })
+            .collect();
 
         // Include essential theme files (if theme detected)
         // We add the relative path (from the site root) so filename matches are scoped
@@ -239,7 +299,7 @@ impl WordPressProfilePlugin {
         }
 
         // Include main plugin files for active plugins (plugin_paths are normalized to plugin root)
-        for plugin_dir in plugin_paths {
+        for plugin_dir in final_plugin_paths {
             if let Some(plugin_name) = plugin_dir.file_name().and_then(|n| n.to_str()) {
                 let main_plugin_file = format!("{}.php", plugin_name);
                 let plugin_file_path = plugin_dir.join(&main_plugin_file);
@@ -307,13 +367,14 @@ impl WordPressProfilePlugin {
                 if let Ok(plugins) =
                     serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
                 {
-                    let mut plugin_paths = Vec::new();
-                    for plugin in plugins {
-                        if let Some(plugin_name) = plugin.get("name").and_then(|n| n.as_str()) {
-                            plugin_paths
-                                .push(PathBuf::from("wp-content/plugins").join(plugin_name));
-                        }
-                    }
+                    let plugin_paths = plugins
+                        .iter()
+                        .filter_map(|p| {
+                            p.get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| PathBuf::from("wp-content/plugins").join(s))
+                        })
+                        .collect();
                     return Ok(plugin_paths);
                 }
             }

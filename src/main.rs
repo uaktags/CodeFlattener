@@ -293,6 +293,14 @@ struct Args {
     /// WordPress-profile-specific: comma-separated list of plugin slugs to exclude (e.g. woocommerce,elementor-pro)
     #[arg(long, value_delimiter = ',', use_value_delimiter = true)]
     wp_exclude_plugins: Option<Vec<String>>,
+
+    /// WordPress-profile-specific: comma-separated list of plugin slugs to exclusively include
+    #[arg(long, value_delimiter = ',', use_value_delimiter = true)]
+    wp_include_only_plugins: Option<Vec<String>>,
+
+    /// WordPress-profile-specific: theme to include
+    #[arg(long)]
+    wp_include_theme: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -643,6 +651,46 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
         return false;
     }
 
+    // WordPress-profile specific: if --wp-include-only-plugins or --wp-include-theme is used,
+    // we should ONLY include those directories and wp-config.php.
+    if args.profile == Some(ProfileChoice::WordPress)
+        && (args.wp_include_only_plugins.is_some() || args.wp_include_theme.is_some())
+    {
+        if let Ok(rel) = path.strip_prefix(base_dir) {
+            let rel_str_lower = rel.to_string_lossy().to_lowercase();
+
+            // Always allow wp-config.php
+            if rel_str_lower == "wp-config.php" {
+                return true;
+            }
+
+            // Check if path is inside one of the included plugins
+            if let Some(includes) = &args.wp_include_only_plugins {
+                for raw in includes {
+                    let slug = raw.split('/').next().unwrap_or(raw).to_lowercase();
+                    let plugin_prefix = format!("wp-content/plugins/{}", slug);
+                    if rel_str_lower.starts_with(&plugin_prefix) {
+                        return true;
+                    }
+                }
+            }
+
+            // Check if path is inside the included theme
+            if let Some(theme_name) = &args.wp_include_theme {
+                let theme_prefix = format!("wp-content/themes/{}", theme_name.to_lowercase());
+                if rel_str_lower.starts_with(&theme_prefix) {
+                    return true;
+                }
+            }
+
+            // If we are here, the path is not in any of the allowed include lists, so deny it.
+            return false;
+        } else {
+            // If we can't get a relative path, deny it to be safe.
+            return false;
+        }
+    }
+
     // For WordPress profile, exclude common core WordPress files
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         let core_wp_files = [
@@ -920,6 +968,8 @@ fn load_profile_settings(
                 "wordpress",
                 &wp_root,
                 args.wp_exclude_plugins.as_deref(),
+                args.wp_include_only_plugins.as_deref(),
+                args.wp_include_theme.as_deref(),
             ) {
                 if args.verbose {
                     info!(
@@ -1155,6 +1205,8 @@ mod tests {
             progress: false,
             dry_run: false,
             wp_exclude_plugins: None,
+            wp_include_only_plugins: None,
+            wp_include_theme: None,
         };
 
         assert!(should_process_path(&file_path, &args, base_path));
