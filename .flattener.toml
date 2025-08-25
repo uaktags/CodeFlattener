@@ -1,0 +1,33 @@
+# Example 4: Rust Project
+[profiles.rust2]
+description = "Profile for a Rust project"
+exclude_dirs = ["target", "target/debug", "target/release"]
+include_globs = ["src/*"]
+allowed_filenames = ["Cargo.toml", "Cargo.lock"]
+max_size = 1.0
+gpt4_tokens = true
+
+[profiles.battle-system]
+description = "Profile for the battle system in the Next.js project"
+extensions = ["tsx", "css", "js"]
+include_globs = [
+    "src/pages/_app.tsx",
+    "src/components/Layout.tsx",
+    "src/components/MainArea.tsx",
+    "src/components/navLoggedOut.tsx",
+    "src/components/navLoggedIn.tsx",
+    "src/components/Sidebar.tsx",
+    "src/components/NavSkeleton.tsx",
+    "src/components/MainAreaSkeleton.tsx",
+    "src/components/SidebarSkeleton.tsx",
+    "src/pages/index.tsx",
+    "src/pages/home/overview.tsx",
+    "src/components/news-bulletin.tsx",
+    "src/components/ContentCard.tsx",
+    "src/components/RpgAwesomeIcon.tsx",
+    "src/components/loading-dots.tsx",
+    "src/styles/global.css",
+    "tailwind.config.js",
+    "postcss.config.js",
+]
+markdown = true

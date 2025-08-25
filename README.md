@@ -1,2 +1,2 @@
 # CodeFlattener
-A blazingly-fast, rust based, cli program to flatten a codebased to upload to AIStudio
+A blazingly-fast, rust based, cli program to flatten a codebase to upload to AIStudio

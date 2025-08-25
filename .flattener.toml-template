@@ -1,0 +1,231 @@
+# CodeFlattener Configuration Template
+# This file demonstrates all available configuration options for the CodeFlattener project.
+# Copy this file to your project directory and customize it as needed.
+
+# =============================================================================
+# PROFILE CONFIGURATION
+# =============================================================================
+
+# Choose a predefined profile for specific project types
+# Available profiles: nextjs-ts-prisma, cpp-cmake, rust, wordpress
+# profile = "nextjs-ts-prisma"
+
+# Custom profile configuration (overrides predefined profiles)
+# Uncomment and customize the sections below to create your own profile
+
+# [profile.custom]
+# description = "Custom project configuration"
+# allowed_extensions = [".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".scss", ".md"]
+# allowed_filenames = ["package.json", "tsconfig.json", "tailwind.config.js"]
+
+# =============================================================================
+# FILE SELECTION SETTINGS
+# =============================================================================
+
+# File extensions to include (overrides profile settings)
+# Extensions should include the dot (e.g., ".js", ".ts", ".php")
+# extensions = [".js", ".ts", ".jsx", ".tsx", ".json", ".md", ".css", ".scss"]
+
+# Specific filenames to include regardless of extension
+# This is useful for configuration files that don't have standard extensions
+# allowed_filenames = ["package.json", "tsconfig.json", "webpack.config.js", "Dockerfile"]
+
+# Maximum file size to process in megabytes (MB)
+# Files larger than this will be skipped
+# max_size = 2.0
+
+# =============================================================================
+# INCLUDE/EXCLUDE PATTERNS
+# =============================================================================
+
+# Directories to include (relative to target directory)
+# Only files within these directories will be processed
+# include_dirs = ["src", "components", "lib", "utils"]
+
+# Directories to exclude (relative to target directory)
+# Files within these directories will be skipped
+# exclude_dirs = ["node_modules", "dist", "build", "target", ".git"]
+
+# Exclude common directories by name
+# exclude_node_modules = true      # Skip node_modules directories
+# exclude_build_dirs = true        # Skip target/, build/, dist/ directories
+# exclude_hidden_dirs = true       # Skip directories starting with '.'
+
+# Maximum directory depth to traverse
+# max_depth = 100
+
+# Pattern-based exclusions (simple string matching)
+# Files or directories containing these patterns will be excluded
+# exclude_patterns = ["test", "spec", "__tests__", "coverage"]
+
+# Pattern-based inclusions (simple string matching)
+# Only files or directories containing these patterns will be included
+# include_patterns = ["src", "lib", "components"]
+
+# Glob pattern exclusions (more powerful pattern matching)
+# Uses glob syntax for flexible pattern matching
+# exclude_globs = ["**/test/**", "**/*.test.*", "**/*.spec.*", "**/coverage/**"]
+
+# Glob pattern inclusions (more powerful pattern matching)
+# Only files matching these glob patterns will be included
+# include_globs = ["src/**/*", "lib/**/*", "components/**/*"]
+
+# =============================================================================
+# WORDPRESS-SPECIFIC SETTINGS
+# =============================================================================
+
+# WordPress profile configuration
+# Use this section when profile = "wordpress"
+
+# [wordpress]
+# # Comma-separated list of plugin slugs to exclude
+# # Example: "woocommerce,elementor-pro,contact-form-7"
+# exclude_plugins = []
+
+# # Comma-separated list of plugin slugs to exclusively include
+# # When specified, only these plugins will be included
+# # Example: "my-custom-plugin,another-plugin"
+# include_only_plugins = []
+
+# # Theme to include exclusively
+# # When specified, only this theme will be included
+# # Example: "twentytwentyfour"
+# include_theme = ""
+
+# =============================================================================
+# OUTPUT CONFIGURATION
+# =============================================================================
+
+# Output file path for the flattened code
+# If not specified, output will be printed to console
+# output = "flattened-code.txt"
+
+# Format the output content using Markdown code blocks
+# Each file will be wrapped in ```language``` markers
+# markdown = true
+
+# Use GPT-4 tokenizer for more accurate token counting
+# This provides better token estimation for AI models
+# gpt4_tokens = true
+
+# =============================================================================
+# GIT INTEGRATION
+# =============================================================================
+
+# Include current Git status and diffs in the output
+# This adds a section showing uncommitted changes
+# include_git_changes = true
+
+# Control which git diffs to include
+# no_staged_diff = false    # Don't include staged changes (git diff --staged)
+# no_unstaged_diff = false  # Don't include unstaged changes (git diff)
+
+# =============================================================================
+# PROCESSING SETTINGS
+# =============================================================================
+
+# Enable parallel processing for better performance on large projects
+# parallel = true
+
+# Show progress bar during processing
+# progress = true
+
+# Dry run mode - log which files would be processed but don't read them
+# Useful for testing configuration without processing files
+# dry_run = true
+
+# =============================================================================
+# EXAMPLE CONFIGURATIONS
+# =============================================================================
+
+# Example 1: Next.js Project
+# [example.nextjs]
+# profile = "nextjs-ts-prisma"
+# exclude_dirs = ["node_modules", ".next", "dist"]
+# max_size = 5.0
+# markdown = true
+# gpt4_tokens = true
+
+# Example 2: WordPress Theme Development
+# [example.wordpress-theme]
+# profile = "wordpress"
+# include_theme = "my-custom-theme"
+# exclude_plugins = ["woocommerce", "elementor-pro"]
+# max_size = 3.0
+# markdown = true
+
+# Example 3: Custom JavaScript Project
+# [example.custom-js]
+# profile = ""
+# extensions = [".js", ".jsx", ".ts", ".tsx", ".json", "package.json"]
+# exclude_dirs = ["node_modules", "dist", "build"]
+# include_globs = ["src/**/*", "components/**/*", "public/**/*"]
+# max_size = 2.0
+# markdown = true
+
+# Example 4: Rust Project
+# [example.rust]
+# profile = "rust"
+# exclude_dirs = ["target", "target/debug", "target/release"]
+# allowed_filenames = ["Cargo.toml", "Cargo.lock", "build.rs"]
+# max_size = 1.0
+# gpt4_tokens = true
+
+# =============================================================================
+# ADVANCED CONFIGURATION
+# =============================================================================
+
+# Advanced file filtering with multiple criteria
+# [advanced]
+# # Complex include/exclude logic
+# include_dirs = ["src", "lib"]
+# exclude_dirs = ["src/tests", "lib/examples"]
+# exclude_patterns = ["test", "spec", "__tests__"]
+# include_globs = ["src/**/*.{ts,tsx,js,jsx}", "lib/**/*.{rs,go}"]
+# exclude_globs = ["**/*.test.{ts,js}", "**/*.spec.{ts,js}", "**/coverage/**"]
+
+# # Large project handling
+# max_size = 10.0
+# max_depth = 50
+# parallel = true
+# progress = true
+
+# # AI-focused configuration
+# markdown = true
+# gpt4_tokens = true
+# include_git_changes = true
+# output = "ai-analysis.md"
+
+# =============================================================================
+# NOTES
+# =============================================================================
+
+# 1. Profile Priority:
+#    - Command line arguments have highest priority
+#    - Configuration file settings override profile defaults
+#    - Profile settings override built-in defaults
+
+# 2. Pattern Matching:
+#    - Simple patterns use basic string matching
+#    - Glob patterns use ** for recursive matching, * for single directory
+#    - Examples: "**/test/**", "*.js", "src/**/*.{ts,tsx}"
+
+# 3. WordPress Profile:
+#    - Automatically detects active themes and plugins via wp-cli
+#    - Falls back to filesystem scanning if wp-cli is unavailable
+#    - Excludes core WordPress files by default
+
+# 4. File Size Limits:
+#    - Default is 2MB per file
+#    - Adjust based on your project needs
+#    - Very large files can slow down processing
+
+# 5. Performance Tips:
+#    - Use parallel = true for large projects
+#    - Be specific with include/exclude patterns
+#    - Use max_depth to limit recursion depth
+#    - Exclude unnecessary directories like node_modules, dist, etc.
+
+# =============================================================================
+# END OF TEMPLATE
+# =============================================================================

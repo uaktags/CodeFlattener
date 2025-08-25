@@ -432,7 +432,7 @@ fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     if args.list_profiles {
         list_profiles();
@@ -523,10 +523,16 @@ fn validate_config(args: &Args) -> Result<()> {
 
     Ok(())
 }
-
 fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<ProcessingResult> {
     apply_profile_settings(args, config)?;
-
+ 
+    // Debug log the effective profile-derived settings so we can diagnose missing files (helps on Windows where globs
+    // may use forward slashes).
+    info!(
+        "Effective profile settings - extensions: {:?}, allowed_filenames: {:?}, include_globs: {:?}, max_size: {}MB",
+        args.extensions, args.allowed_filenames, args.include_globs, args.max_size
+    );
+ 
     let mut extensions: HashSet<String> = HashSet::new();
     if let Some(exts) = &args.extensions {
         extensions = exts
@@ -534,7 +540,6 @@ fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<P
             .map(|e| if e.starts_with('.') { e.clone() } else { format!(".{}", e) })
             .collect();
     }
-
     let mut allowed_filenames: HashSet<String> = HashSet::new();
     if let Some(files) = &args.allowed_filenames {
         allowed_filenames = files.iter().cloned().collect();
@@ -719,7 +724,18 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
     // Check glob patterns
     if let Some(exclude_globs) = &args.exclude_globs {
         for pattern in exclude_globs {
-            if let Ok(glob_pattern) = Pattern::new(pattern) {
+            // Normalize pattern for the host OS (allow toml patterns like "src/*" to work on Windows).
+            let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+            if let Ok(glob_pattern) = Pattern::new(&pat_os) {
+                if glob_pattern.matches_path(relative_path) {
+                    return false;
+                }
+                // Also try matching against a forward-slash-normalized path string as a fallback.
+                let rel_forward = relative_path.to_string_lossy().replace('\\', "/");
+                if glob_pattern.matches_path(std::path::Path::new(&rel_forward)) {
+                    return false;
+                }
+            } else if let Ok(glob_pattern) = Pattern::new(pattern) {
                 if glob_pattern.matches_path(relative_path) {
                     return false;
                 }
@@ -730,7 +746,20 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
     if let Some(include_globs) = &args.include_globs {
         let mut included = false;
         for pattern in include_globs {
-            if let Ok(glob_pattern) = Pattern::new(pattern) {
+            // Normalize pattern to account for Windows path separators in TOML authored globs.
+            let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+            if let Ok(glob_pattern) = Pattern::new(&pat_os) {
+                if glob_pattern.matches_path(relative_path) {
+                    included = true;
+                    break;
+                }
+                // Fallback: try matching against a forward-slash-normalized string path
+                let rel_forward = relative_path.to_string_lossy().replace('\\', "/");
+                if glob_pattern.matches_path(std::path::Path::new(&rel_forward)) {
+                    included = true;
+                    break;
+                }
+            } else if let Ok(glob_pattern) = Pattern::new(pattern) {
                 if glob_pattern.matches_path(relative_path) {
                     included = true;
                     break;
