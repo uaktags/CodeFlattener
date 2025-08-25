@@ -1,1043 +1,7 @@
 
 
-# --- File: /home/tim/CodeFlattener/src/main.rs ---
-
-// src/main.rs
-
-use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
-use glob::Pattern;
-use ignore::WalkBuilder;
-use once_cell::sync::Lazy;
-use rayon::prelude::*;
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
-use tiktoken_rs::p50k_base;
-use tracing::{Level, debug, info, warn};
-use tracing_subscriber::FmtSubscriber;
-
-// Configuration file structure
-#[derive(Debug, Deserialize)]
-struct ConfigFile {
-    profile: Option<String>,
-    extensions: Option<Vec<String>>,
-    allowed_filenames: Option<Vec<String>>,
-    max_size: Option<f64>,
-    markdown: Option<bool>,
-    gpt4_tokens: Option<bool>,
-    include_git_changes: Option<bool>,
-    no_staged_diff: Option<bool>,
-    no_unstaged_diff: Option<bool>,
-    include_dirs: Option<Vec<PathBuf>>,
-    exclude_dirs: Option<Vec<PathBuf>>,
-    exclude_patterns: Option<Vec<String>>,
-    include_patterns: Option<Vec<String>>,
-    exclude_globs: Option<Vec<String>>,
-    include_globs: Option<Vec<String>>,
-    exclude_node_modules: Option<bool>,
-    exclude_build_dirs: Option<bool>,
-    exclude_hidden_dirs: Option<bool>,
-    max_depth: Option<usize>,
-}
-
-// Plugin trait for custom profiles
-trait ProfilePlugin {
-    fn get_profile(&self, name: &str) -> Option<Profile>;
-    fn list_profiles(&self) -> Vec<String>;
-}
-
-// Default profile plugin using built-in profiles
-struct DefaultProfilePlugin;
-impl ProfilePlugin for DefaultProfilePlugin {
-    fn get_profile(&self, name: &str) -> Option<Profile> {
-        PROFILES.get(name).cloned()
-    }
-
-    fn list_profiles(&self) -> Vec<String> {
-        PROFILES.keys().map(|s| s.to_string()).collect()
-    }
-}
-
-// Lazily initialized static map of predefined profiles
-static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    m.insert(
-        "nextjs-ts-prisma",
-        Profile {
-            description: "Next.js, TypeScript, Prisma project files.",
-            allowed_extensions: &[
-                ".ts",
-                ".tsx",
-                ".js",
-                ".jsx",
-                ".json",
-                ".css",
-                ".scss",
-                ".sass",
-                ".less",
-                ".html",
-                ".htm",
-                ".md",
-                ".mdx",
-                ".graphql",
-                ".gql",
-                ".env",
-                ".env.local",
-                ".env.development",
-                ".env.production",
-                ".yml",
-                ".yaml",
-                ".xml",
-                ".toml",
-                ".ini",
-                ".vue",
-                ".svelte",
-                ".prisma",
-            ],
-            allowed_filenames: &[
-                "next.config.js",
-                "tailwind.config.js",
-                "postcss.config.js",
-                "middleware.ts",
-                "middleware.js",
-                "schema.prisma",
-            ],
-        },
-    );
-    m.insert(
-        "cpp-cmake",
-        Profile {
-            description: "C/C++ and CMake project files.",
-            allowed_extensions: &[
-                ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".ino", ".cmake", ".txt", ".md",
-                ".json", ".xml", ".yml", ".yaml", ".ini", ".proto", ".fbs",
-            ],
-            allowed_filenames: &["CMakeLists.txt"],
-        },
-    );
-    m.insert(
-        "rust",
-        Profile {
-            description: "Rust project files.",
-            allowed_extensions: &[
-                ".rs", ".toml", ".md", ".yml", ".yaml", ".sh", ".json", ".html",
-            ],
-            allowed_filenames: &["Cargo.toml", "Cargo.lock", "build.rs", ".rustfmt.toml"],
-        },
-    );
-    m
-});
-
-#[derive(Debug, Clone)]
-struct Profile {
-    description: &'static str,
-    allowed_extensions: &'static [&'static str],
-    allowed_filenames: &'static [&'static str],
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "A blazingly fast code flattener, written in Rust.",
-    long_about = "Flattens code files from directories, filters by extension, and counts tokens, with profile support."
-)]
-struct Args {
-    /// One or more directories to scan. Defaults to current directory.
-    #[arg(default_value = ".")]
-    target_dirs: Vec<PathBuf>,
-
-    /// Output file path for the flattened code. If not specified, prints to console.
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// Use a predefined profile for a specific project type.
-    #[arg(short, long, value_enum)]
-    profile: Option<ProfileChoice>,
-
-    /// List all available profiles and their descriptions.
-    #[arg(long)]
-    list_profiles: bool,
-
-    /// Comma-separated list of allowed file extensions (overrides profile).
-    #[arg(short, long, value_delimiter = ',', use_value_delimiter = true)]
-    extensions: Option<Vec<String>>,
-
-    /// Space-separated list of specific filenames to include (overrides profile).
-    #[arg(short, long, value_delimiter = ' ')]
-    allowed_filenames: Option<Vec<String>>,
-
-    /// Maximum file size to process in megabytes (MB).
-    #[arg(long, default_value_t = 2.0)]
-    max_size: f64,
-
-    /// Format the output content using Markdown code blocks.
-    #[arg(long)]
-    markdown: bool,
-
-    /// Use GPT-4 tokenizer for more accurate token counting.
-    #[arg(long)]
-    gpt4_tokens: bool,
-
-    /// Append a section with current Git status and diffs.
-    #[arg(short = 'g', long = "include-git-changes")]
-    include_git_changes: bool,
-
-    /// Do NOT include staged changes (git diff --staged).
-    #[arg(long, requires = "include_git_changes")]
-    no_staged_diff: bool,
-
-    /// Do NOT include unstaged changes (git diff).
-    #[arg(long, requires = "include_git_changes")]
-    no_unstaged_diff: bool,
-
-    /// Print verbose output during processing.
-    #[arg(short, long)]
-    verbose: bool,
-
-    /// Configuration file path
-    #[arg(short, long)]
-    config: Option<PathBuf>,
-
-    /// Comma-separated list of directories to include (relative to target)
-    #[arg(long, value_delimiter = ',')]
-    include_dirs: Option<Vec<PathBuf>>,
-
-    /// Comma-separated list of directories to exclude (relative to target)
-    #[arg(long, value_delimiter = ',')]
-    exclude_dirs: Option<Vec<PathBuf>>,
-
-    /// Exclude node_modules directories (common in JS projects)
-    #[arg(long)]
-    exclude_node_modules: bool,
-
-    /// Exclude target/ and build/ directories (common in compiled projects)
-    #[arg(long)]
-    exclude_build_dirs: bool,
-
-    /// Exclude hidden directories (starting with .)
-    #[arg(long)]
-    exclude_hidden_dirs: bool,
-
-    /// Maximum directory depth to traverse
-    #[arg(long, default_value_t = 100)]
-    max_depth: usize,
-
-    /// Comma-separated list of patterns to exclude
-    #[arg(long, value_delimiter = ',')]
-    exclude_patterns: Option<Vec<String>>,
-
-    /// Comma-separated list of patterns to include
-    #[arg(long, value_delimiter = ',')]
-    include_patterns: Option<Vec<String>>,
-
-    /// Comma-separated list of glob patterns to exclude
-    #[arg(long, value_delimiter = ',')]
-    exclude_globs: Option<Vec<String>>,
-
-    /// Comma-separated list of glob patterns to include
-    #[arg(long, value_delimiter = ',')]
-    include_globs: Option<Vec<String>>,
-
-    /// Enable parallel processing
-    #[arg(long)]
-    parallel: bool,
-
-    /// Show progress bar
-    #[arg(long)]
-    progress: bool,
-}
-
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
-enum ProfileChoice {
-    #[clap(name = "nextjs-ts-prisma")]
-    NextjsTsPrisma,
-    #[clap(name = "cpp-cmake")]
-    CppCmake,
-    #[clap(name = "rust")]
-    Rust,
-}
-
-#[derive(Debug)]
-struct ProcessingResult {
-    content: String,
-    file_count: usize,
-    token_count: usize,
-}
-
-fn main() -> Result<()> {
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    let args = Args::parse();
-
-    if args.list_profiles {
-        list_profiles();
-        return Ok(());
-    }
-
-    // Load configuration from file if specified
-    let config = load_config(&args.config)?;
-    let args = merge_config_with_args(args, config);
-
-    // Validate configuration
-    validate_config(&args)?;
-
-    let result = process_directories(&args)?;
-
-    // Output results
-    output_results(&result, &args)?;
-
-    info!(
-        "Processing complete: {} files, {} tokens",
-        result.file_count, result.token_count
-    );
-
-    Ok(())
-}
-
-fn load_config(config_path: &Option<PathBuf>) -> Result<Option<ConfigFile>> {
-    let path = config_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from(".flattener.toml"));
-
-    if path.exists() {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: ConfigFile = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-        return Ok(Some(config));
-    }
-    Ok(None)
-}
-
-fn merge_config_with_args(mut args: Args, config: Option<ConfigFile>) -> Args {
-    if let Some(config) = config {
-        if args.profile.is_none() {
-            if let Some(profile) = config.profile {
-                args.profile = match profile.as_str() {
-                    "nextjs-ts-prisma" => Some(ProfileChoice::NextjsTsPrisma),
-                    "cpp-cmake" => Some(ProfileChoice::CppCmake),
-                    "rust" => Some(ProfileChoice::Rust),
-                    _ => None,
-                };
-            }
-        }
-
-        // Merge other config options (simplified for brevity)
-        if let Some(exts) = config.extensions {
-            args.extensions = Some(exts);
-        }
-        // ... merge other config fields similarly
-    }
-    args
-}
-
-fn validate_config(args: &Args) -> Result<()> {
-    // Validate directory conflicts
-    if let (Some(include_dirs), Some(exclude_dirs)) = (&args.include_dirs, &args.exclude_dirs) {
-        for include_dir in include_dirs {
-            for exclude_dir in exclude_dirs {
-                if exclude_dir.starts_with(include_dir) {
-                    return Err(anyhow::anyhow!(
-                        "Conflict: exclude directory '{}' is within include directory '{}'",
-                        exclude_dir.display(),
-                        include_dir.display()
-                    ));
-                }
-            }
-        }
-    }
-
-    // Validate max size
-    if args.max_size > 100.0 {
-        return Err(anyhow::anyhow!("Max file size cannot exceed 100MB"));
-    }
-
-    Ok(())
-}
-
-fn process_directories(args: &Args) -> Result<ProcessingResult> {
-    let mut extensions: HashSet<String> = HashSet::new();
-    let mut allowed_filenames: HashSet<String> = HashSet::new();
-
-    // Load profile settings
-    load_profile_settings(args, &mut extensions, &mut allowed_filenames)?;
-
-    if extensions.is_empty() && allowed_filenames.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No allowed extensions or filenames specified"
-        ));
-    }
-
-    let max_file_size = (args.max_size * 1024.0 * 1024.0) as u64;
-    let all_contents = Arc::new(Mutex::new(String::new()));
-    let file_count = Arc::new(Mutex::new(0));
-
-    info!("Starting code flattening");
-    debug!("Target directories: {:?}", args.target_dirs);
-    debug!("Allowed extensions: {:?}", extensions);
-    debug!("Max file size: {:.2} MB", args.max_size);
-
-    for start_dir in &args.target_dirs {
-        let start_dir = fs::canonicalize(start_dir)
-            .with_context(|| format!("Failed to canonicalize path: {}", start_dir.display()))?;
-
-        if !is_safe_path(&start_dir, &start_dir) {
-            return Err(anyhow::anyhow!(
-                "Path traversal detected: {}",
-                start_dir.display()
-            ));
-        }
-
-        let walker = build_walker(&start_dir, args);
-        let entries: Vec<_> = walker.build().filter_map(Result::ok).collect();
-
-        if args.parallel {
-            process_entries_parallel(
-                &entries,
-                &start_dir,
-                &extensions,
-                &allowed_filenames,
-                max_file_size,
-                args,
-                &all_contents,
-                &file_count,
-            )?;
-        } else {
-            process_entries_sequential(
-                &entries,
-                &start_dir,
-                &extensions,
-                &allowed_filenames,
-                max_file_size,
-                args,
-                &all_contents,
-                &file_count,
-            )?;
-        }
-    }
-
-    let mut git_output = String::new();
-    if args.include_git_changes {
-        if let Ok(Some(root)) =
-            find_git_root(args.target_dirs.first().unwrap_or(&PathBuf::from(".")))
-        {
-            if let Ok(Some(output)) = get_git_changes(
-                &root,
-                !args.no_staged_diff,
-                !args.no_unstaged_diff,
-                args.verbose,
-            ) {
-                git_output = output;
-            }
-        }
-    }
-
-    let content = {
-        let mut content = all_contents.lock().unwrap().clone();
-        content.push_str(&git_output);
-        content
-    };
-
-    let token_count = if args.gpt4_tokens {
-        p50k_base()
-            .unwrap()
-            .encode_with_special_tokens(&content)
-            .len()
-    } else {
-        content.split_whitespace().count()
-    };
-
-    Ok(ProcessingResult {
-        content,
-        file_count: *file_count.lock().unwrap(),
-        token_count,
-    })
-}
-
-fn build_walker(start_dir: &Path, args: &Args) -> WalkBuilder {
-    let mut walker = WalkBuilder::new(start_dir);
-
-    walker.max_depth(Some(args.max_depth));
-
-    if args.exclude_node_modules {
-        walker.filter_entry(|entry| {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            name != "node_modules"
-        });
-    }
-
-    if args.exclude_build_dirs {
-        walker.filter_entry(|entry| {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            !matches!(name.as_ref(), "target" | "build" | "dist")
-        });
-    }
-
-    if args.exclude_hidden_dirs {
-        walker.filter_entry(|entry| {
-            let path = entry.path();
-            !path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with('.')
-        });
-    }
-
-    walker
-}
-
-fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
-    if path.is_dir() {
-        return false;
-    }
-
-    let relative_path = match path.strip_prefix(base_dir) {
-        Ok(p) => p,
-        Err(_) => path,
-    };
-
-    // Check .flattenerignore
-    if is_ignored_by_file(path, base_dir) {
-        return false;
-    }
-
-    // Check directory inclusions/exclusions
-    if let Some(exclude_dirs) = &args.exclude_dirs {
-        for exclude_dir in exclude_dirs {
-            if relative_path.starts_with(exclude_dir) {
-                return false;
-            }
-        }
-    }
-
-    if let Some(include_dirs) = &args.include_dirs {
-        let mut included = false;
-        for include_dir in include_dirs {
-            if relative_path.starts_with(include_dir) {
-                included = true;
-                break;
-            }
-        }
-        if !included {
-            return false;
-        }
-    }
-
-    // Check glob patterns
-    if let Some(exclude_globs) = &args.exclude_globs {
-        for pattern in exclude_globs {
-            if let Ok(glob_pattern) = Pattern::new(pattern) {
-                if glob_pattern.matches_path(relative_path) {
-                    return false;
-                }
-            }
-        }
-    }
-
-    if let Some(include_globs) = &args.include_globs {
-        let mut included = false;
-        for pattern in include_globs {
-            if let Ok(glob_pattern) = Pattern::new(pattern) {
-                if glob_pattern.matches_path(relative_path) {
-                    included = true;
-                    break;
-                }
-            }
-        }
-        if !included {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn is_ignored_by_file(path: &Path, base_dir: &Path) -> bool {
-    let ignore_patterns = load_ignore_patterns();
-    let relative_path = match path.strip_prefix(base_dir) {
-        Ok(p) => p,
-        Err(_) => path,
-    };
-
-    ignore_patterns
-        .iter()
-        .any(|pattern| pattern.matches_path(relative_path))
-}
-
-fn load_ignore_patterns() -> Vec<Pattern> {
-    let mut patterns = Vec::new();
-    if let Ok(content) = fs::read_to_string(".flattenerignore") {
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() && !line.starts_with('#') {
-                if let Ok(pattern) = Pattern::new(line) {
-                    patterns.push(pattern);
-                }
-            }
-        }
-    }
-    patterns
-}
-
-fn process_entries_parallel(
-    entries: &[ignore::DirEntry],
-    start_dir: &Path,
-    extensions: &HashSet<String>,
-    allowed_filenames: &HashSet<String>,
-    max_file_size: u64,
-    args: &Args,
-    all_contents: &Arc<Mutex<String>>,
-    file_count: &Arc<Mutex<usize>>,
-) -> Result<()> {
-    entries.par_iter().for_each(|entry| {
-        let path = entry.path();
-
-        if !should_process_path(path, args, start_dir) {
-            return;
-        }
-
-        if let Err(e) = process_single_file(
-            path,
-            extensions,
-            allowed_filenames,
-            max_file_size,
-            args,
-            all_contents,
-            file_count,
-        ) {
-            warn!("Failed to process {}: {}", path.display(), e);
-        }
-    });
-    Ok(())
-}
-
-fn process_entries_sequential(
-    entries: &[ignore::DirEntry],
-    start_dir: &Path,
-    extensions: &HashSet<String>,
-    allowed_filenames: &HashSet<String>,
-    max_file_size: u64,
-    args: &Args,
-    all_contents: &Arc<Mutex<String>>,
-    file_count: &Arc<Mutex<usize>>,
-) -> Result<()> {
-    for entry in entries {
-        let path = entry.path();
-
-        if !should_process_path(path, args, start_dir) {
-            continue;
-        }
-
-        process_single_file(
-            path,
-            extensions,
-            allowed_filenames,
-            max_file_size,
-            args,
-            all_contents,
-            file_count,
-        )?;
-    }
-    Ok(())
-}
-
-fn process_single_file(
-    path: &Path,
-    extensions: &HashSet<String>,
-    allowed_filenames: &HashSet<String>,
-    max_file_size: u64,
-    args: &Args,
-    all_contents: &Arc<Mutex<String>>,
-    file_count: &Arc<Mutex<usize>>,
-) -> Result<()> {
-    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-    let extension = path.extension().unwrap_or_default().to_string_lossy();
-
-    let is_allowed_ext = extensions.contains(&format!(".{}", extension));
-    let is_allowed_file = allowed_filenames.contains(file_name.as_ref());
-
-    if !is_allowed_ext && !is_allowed_file {
-        return Ok(());
-    }
-
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("Failed to get metadata for {}", path.display()))?;
-
-    if metadata.len() > max_file_size {
-        if args.verbose {
-            info!("Skipping large file: {}", path.display());
-        }
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read file {}", path.display()))?;
-
-    let file_path_str = path.to_string_lossy();
-    let mut formatted_content = if args.markdown {
-        format!("\n\n```{}\n# --- File: {} ---\n", extension, file_path_str)
-    } else {
-        format!("\n\n# --- File: {} ---\n\n", file_path_str)
-    };
-
-    formatted_content.push_str(&content);
-
-    if args.markdown {
-        formatted_content.push_str("\n```\n");
-    }
-
-    let mut all_contents = all_contents.lock().unwrap();
-    all_contents.push_str(&formatted_content);
-
-    let mut count = file_count.lock().unwrap();
-    *count += 1;
-
-    if args.verbose {
-        info!("Processed: {}", path.display());
-    }
-
-    Ok(())
-}
-
-fn output_results(result: &ProcessingResult, args: &Args) -> Result<()> {
-    if let Some(output_path) = &args.output {
-        if let Some(parent) = output_path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create output directory: {}", parent.display())
-                })?;
-            }
-        }
-
-        let file = fs::File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
-        let mut writer = BufWriter::new(file);
-        write!(writer, "{}", result.content).with_context(|| {
-            format!("Failed to write to output file: {}", output_path.display())
-        })?;
-
-        info!("Flattened code written to: {}", output_path.display());
-    } else {
-        let mut stdout = io::stdout().lock();
-        write!(stdout, "{}", result.content)?;
-    }
-
-    info!("Total files processed: {}", result.file_count);
-    info!("Approximate token count: {}", result.token_count);
-
-    Ok(())
-}
-
-fn load_profile_settings(
-    args: &Args,
-    extensions: &mut HashSet<String>,
-    allowed_filenames: &mut HashSet<String>,
-) -> Result<()> {
-    let plugin: Box<dyn ProfilePlugin> = Box::new(DefaultProfilePlugin);
-
-    if let Some(profile_choice) = &args.profile {
-        let profile_key = match profile_choice {
-            ProfileChoice::NextjsTsPrisma => "nextjs-ts-prisma",
-            ProfileChoice::CppCmake => "cpp-cmake",
-            ProfileChoice::Rust => "rust",
-        };
-
-        if let Some(profile) = plugin.get_profile(profile_key) {
-            if args.verbose {
-                info!("Using '{}' profile.", profile_key);
-            }
-            extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
-            allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
-        }
-    }
-
-    if let Some(exts) = &args.extensions {
-        *extensions = exts
-            .iter()
-            .map(|e| {
-                if e.starts_with('.') {
-                    e.clone()
-                } else {
-                    format!(".{}", e)
-                }
-            })
-            .collect();
-        if args.verbose {
-            info!("Extensions overridden: {:?}", extensions);
-        }
-    }
-
-    if let Some(files) = &args.allowed_filenames {
-        *allowed_filenames = files.iter().cloned().collect();
-        if args.verbose {
-            info!("Allowed filenames overridden: {:?}", allowed_filenames);
-        }
-    }
-
-    Ok(())
-}
-
-fn list_profiles() {
-    let plugin: Box<dyn ProfilePlugin> = Box::new(DefaultProfilePlugin);
-    println!("Available Profiles:");
-    for name in plugin.list_profiles() {
-        if let Some(profile) = plugin.get_profile(&name) {
-            println!("  - {}: {}", name, profile.description);
-            println!("    Extensions: {}", profile.allowed_extensions.join(", "));
-            if !profile.allowed_filenames.is_empty() {
-                println!(
-                    "    Allowed Filenames: {}",
-                    profile.allowed_filenames.join(", ")
-                );
-            }
-            println!();
-        }
-    }
-}
-
-fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
-    let mut current_path = fs::canonicalize(start_path)
-        .with_context(|| format!("Failed to find canonical path for {}", start_path.display()))?;
-
-    loop {
-        if current_path.join(".git").is_dir() {
-            return Ok(Some(current_path));
-        }
-        if !current_path.pop() {
-            return Ok(None);
-        }
-    }
-}
-
-fn get_git_changes(
-    git_repo_path: &Path,
-    include_staged: bool,
-    include_unstaged: bool,
-    verbose: bool,
-) -> Result<Option<String>> {
-    let mut output = String::new();
-    output.push_str("\n\n# --- Git Changes ---\n");
-    output.push_str(&format!("# Repository: {}\n\n", git_repo_path.display()));
-
-    let status_output = Command::new("git")
-        .args(["status", "--porcelain", "-uall"])
-        .current_dir(git_repo_path)
-        .output()
-        .context("Failed to execute 'git status'")?;
-
-    if status_output.status.success() {
-        let stdout = String::from_utf8_lossy(&status_output.stdout);
-        if !stdout.trim().is_empty() {
-            output.push_str("## Git Status:\n```bash\n");
-            output.push_str(stdout.trim());
-            output.push_str("\n```\n\n");
-        } else {
-            output.push_str("## Git Status: No uncommitted changes.\n\n");
-        }
-    } else if verbose {
-        warn!(
-            "'git status' failed: {}",
-            String::from_utf8_lossy(&status_output.stderr)
-        );
-    }
-
-    if include_staged {
-        let diff_output = Command::new("git")
-            .args(["diff", "--staged"])
-            .current_dir(git_repo_path)
-            .output()
-            .context("Failed to execute 'git diff --staged'")?;
-
-        if diff_output.status.success() {
-            let stdout = String::from_utf8_lossy(&diff_output.stdout);
-            if !stdout.trim().is_empty() {
-                output.push_str("## Git Diff (Staged):\n```diff\n");
-                output.push_str(stdout.trim());
-                output.push_str("\n```\n\n");
-            }
-        } else if verbose {
-            warn!(
-                "'git diff --staged' failed: {}",
-                String::from_utf8_lossy(&diff_output.stderr)
-            );
-        }
-    }
-
-    if include_unstaged {
-        let diff_output = Command::new("git")
-            .args(["diff"])
-            .current_dir(git_repo_path)
-            .output()
-            .context("Failed to execute 'git diff'")?;
-
-        if diff_output.status.success() {
-            let stdout = String::from_utf8_lossy(&diff_output.stdout);
-            if !stdout.trim().is_empty() {
-                output.push_str("## Git Diff (Unstaged):\n```diff\n");
-                output.push_str(stdout.trim());
-                output.push_str("\n```\n\n");
-            }
-        } else if verbose {
-            warn!(
-                "'git diff' failed: {}",
-                String::from_utf8_lossy(&diff_output.stderr)
-            );
-        }
-    }
-
-    Ok(Some(output))
-}
-
-fn is_safe_path(path: &Path, base_dir: &Path) -> bool {
-    path.canonicalize()
-        .ok()
-        .map(|p| p.starts_with(base_dir))
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_is_safe_path() {
-        let temp_dir = tempdir().unwrap();
-        let base_path = temp_dir.path();
-        let safe_path = base_path.join("subdir/file.txt");
-        assert!(is_safe_path(&safe_path, base_path));
-
-        // This should be safe even if it doesn't exist yet
-        let non_existent = base_path.join("nonexistent");
-        assert!(is_safe_path(&non_existent, base_path));
-    }
-
-    #[test]
-    fn test_should_process_path() {
-        let temp_dir = tempdir().unwrap();
-        let base_path = temp_dir.path();
-        let file_path = base_path.join("src/main.rs");
-
-        fs::create_dir_all(base_path.join("src")).unwrap();
-        fs::write(&file_path, "fn main() {}").unwrap();
-
-        // Create a minimal Args instance for testing
-        let args = Args {
-            target_dirs: vec![base_path.to_path_buf()],
-            output: None,
-            profile: None,
-            list_profiles: false,
-            extensions: None,
-            allowed_filenames: None,
-            max_size: 2.0,
-            markdown: false,
-            gpt4_tokens: false,
-            include_git_changes: false,
-            no_staged_diff: false,
-            no_unstaged_diff: false,
-            verbose: false,
-            config: None,
-            include_dirs: None,
-            exclude_dirs: None,
-            exclude_node_modules: false,
-            exclude_build_dirs: false,
-            exclude_hidden_dirs: false,
-            max_depth: 100,
-            exclude_patterns: None,
-            include_patterns: None,
-            exclude_globs: None,
-            include_globs: None,
-            parallel: false,
-            progress: false,
-        };
-
-        assert!(should_process_path(&file_path, &args, base_path));
-    }
-}
-
-
-# --- File: /home/tim/CodeFlattener/README.md ---
-
-# CodeFlattener
-A blazingly-fast, rust based, cli program to flatten a codebased to upload to AIStudio
-
-
-# --- File: /home/tim/CodeFlattener/Cargo.toml ---
-
-[package]
-name = "code-flattener"
-version = "0.1.2"
-edition = "2024"
-
-[dependencies]
-rayon = "1.8"
-tracing = "0.1"
-tracing-subscriber = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-glob = "0.3"
-anyhow = "1.0.98"
-clap = { version = "4.5.40", features = ["derive", "cargo"] }
-ignore = "0.4.23"
-once_cell = "1.21.3"
-tiktoken-rs = "0.7.0"
-
-
-# --- File: /home/tim/CodeFlattener/Todo.md ---
-
-# Development Plan & TODO
-
-This document outlines future enhancements to make the code flattener more powerful and intuitive for users.
-
-## 1. External Profile Configuration (High Priority)
-
-The current method of hardcoding profiles in a `static HashMap` is inflexible. The tool should support user-defined profiles loaded from an external file.
-
--   **Goal:** Allow users to add or customize profiles without recompiling the application.
--   **Proposed Solution:**
-    1.  **Config File:** Use a TOML file (e.g., `profiles.toml`).
-    2.  **Location:** Search for the config file in standard locations (e.g., user's config directory, project root). The `dirs` crate can help find platform-specific config paths.
-    3.  **Implementation:**
-        -   Use `serde` for deserializing the TOML file into structs.
-        -   At startup, load the default built-in profiles, then load and merge profiles from the user's config file, with user-defined profiles overriding defaults.
-    4.  **Dynamic CLI:** The `--profile` argument needs to be dynamically populated from the loaded profile names. This is a known challenge with `clap::value_enum` and may require using `clap::builder::PossibleValuesParser` or a similar dynamic approach instead of the derive macro.
-
-### 2. Project Type Auto-Detection
-
--   **Goal:** Improve usability by suggesting a profile if none is provided.
--   **Proposed Solution:**
-    -   If the `--profile` flag is omitted, scan the target directory for key indicator files (`Cargo.toml`, `package.json`, `CMakeLists.txt`, `pom.xml`, etc.).
-    -   If a likely project type is identified, either automatically apply that profile or prompt the user to confirm.
-
-### 3. Enhanced Git Integration
-
--   **Goal:** Provide more granular control over what Git information is included.
--   **Proposed Solution:**
-    -   Add a flag to include the output of `git log -n <count>` to show recent commit history.
-    -   Add a flag to diff against a specific branch (e.g., `main` or `develop`) instead of just local staged/unstaged changes.
-
-### 4. Code Quality & Refinements
-
--   **Configuration Loading:** Abstract the configuration logic (profiles, overrides, etc.) into its own module (`config.rs`) to clean up `main.rs`.
--   **Error Handling:** Improve warnings. For example, when a file can't be read, explicitly state if it's being skipped due to a non-UTF8 encoding issue.
-
-
-# --- File: /home/tim/CodeFlattener/Cargo.lock ---
-
+```lock
+# --- File: \\?\C:\Users\uakta\CodeFlattener\Cargo.lock ---
 # This file is automatically @generated by Cargo.
 # It is not intended for manual editing.
 version = 4
@@ -1108,6 +72,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
 
 [[package]]
+name = "assert_cmd"
+version = "2.0.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bd389a4b2970a01282ee455294913c0a43724daedcd1a24c3eb0ec1c1320b66"
+dependencies = [
+ "anstyle",
+ "bstr",
+ "doc-comment",
+ "libc",
+ "predicates 3.1.3",
+ "predicates-core",
+ "predicates-tree",
+ "wait-timeout",
+]
+
+[[package]]
+name = "autocfg"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1127,6 +113,12 @@ name = "bit-vec"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
+
+[[package]]
+name = "bitflags"
+version = "2.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34efbcccd345379ca2868b2b2c9d3782e9cc58ba87bc7d79d5b53d9c9ae6f25d"
 
 [[package]]
 name = "bstr"
@@ -1190,12 +182,16 @@ name = "code-flattener"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "assert_cmd",
  "clap",
  "glob",
  "ignore",
  "once_cell",
+ "predicates 2.1.5",
  "rayon",
  "serde",
+ "serde_json",
+ "tempfile",
  "tiktoken-rs",
  "toml",
  "tracing",
@@ -1234,6 +230,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "difflib"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6184e33543162437515c2e2b48714794e37845ec9851711914eec9d308f6ebe8"
+
+[[package]]
+name = "doc-comment"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fea41bba32d969b513997752735605054bc0dfa92b4c56bf1189f2e174be7a10"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1246,6 +254,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "errno"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1254,6 +272,33 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fastrand"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "float-cmp"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26145e563e54f2cadc477553f1ec5ee650b00862f0a58bcd12cbdc5f0ea2d2f4"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "r-efi",
+ "wasi",
 ]
 
 [[package]]
@@ -1320,10 +365,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
+name = "itertools"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itoa"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "libc"
+version = "0.2.175"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a82ae493e598baaea5209805c49bbf2ea7de956d50d7da0da1164f9c6d28543"
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
 
 [[package]]
 name = "log"
@@ -1338,6 +410,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
 
 [[package]]
+name = "normalize-line-endings"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61807f77802ff30975e01f4f071c8ba10c022052f98b3294119f3e615d13e5be"
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1345,6 +423,15 @@ checksum = "77a8165726e8236064dbb45459242600304b42a5ea24ee2948e18e023bf7ba84"
 dependencies = [
  "overload",
  "winapi",
+]
+
+[[package]]
+name = "num-traits"
+version = "0.2.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
+dependencies = [
+ "autocfg",
 ]
 
 [[package]]
@@ -1372,6 +459,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b3cff922bd51709b605d9ead9aa71031d81447142d828eb4a6eba76fe619f9b"
 
 [[package]]
+name = "predicates"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59230a63c37f3e18569bdb90e4a89cbf5bf8b06fea0b84e65ea10cc4df47addd"
+dependencies = [
+ "difflib",
+ "float-cmp",
+ "itertools",
+ "normalize-line-endings",
+ "predicates-core",
+ "regex",
+]
+
+[[package]]
+name = "predicates"
+version = "3.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d19ee57562043d37e82899fade9a22ebab7be9cef5026b07fda9cdd4293573"
+dependencies = [
+ "anstyle",
+ "difflib",
+ "predicates-core",
+]
+
+[[package]]
+name = "predicates-core"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "727e462b119fe9c93fd0eb1429a5f7647394014cf3c04ab2c0350eeb09095ffa"
+
+[[package]]
+name = "predicates-tree"
+version = "1.0.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72dd2d6d381dfb73a193c7fca536518d7caee39fc8503f74e7dc0be0531b425c"
+dependencies = [
+ "predicates-core",
+ "termtree",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1388,6 +516,12 @@ checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "r-efi"
+version = "5.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "rayon"
@@ -1445,6 +579,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
+name = "rustix"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11181fbabf243db407ef8df94a6ce0b2f9a733bd8be4ad02b4eda9602296cac8"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys",
+]
+
+[[package]]
+name = "ryu"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1471,6 +624,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.143"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d401abef1d108fbd9cbaebc3e46611f4b1021f714a0597a71f41ee463f5f4a5a"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
@@ -1513,6 +678,25 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "tempfile"
+version = "3.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b61f8f20e3a6f7e0649d825294eaf317edce30f82cf6026e7e4cb9222a7d1e"
+dependencies = [
+ "fastrand",
+ "getrandom",
+ "once_cell",
+ "rustix",
+ "windows-sys",
+]
+
+[[package]]
+name = "termtree"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "thread_local"
@@ -1655,6 +839,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1662,6 +855,15 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
+]
+
+[[package]]
+name = "wasi"
+version = "0.14.2+wasi-0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9683f9a5a998d873c0d21fcbe3c083009670149a8fab228644b8bd36b2c48cb3"
+dependencies = [
+ "wit-bindgen-rt",
 ]
 
 [[package]]
@@ -1776,3 +978,2380 @@ checksum = "f3edebf492c8125044983378ecb5766203ad3b4c2f7a922bd7dd207f6d443e95"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "wit-bindgen-rt"
+version = "0.39.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f42320e61fe2cfd34354ecb597f86f413484a798ba44a8ca1165c58d42da6c1"
+dependencies = [
+ "bitflags",
+]
+
+```
+
+
+```toml
+# --- File: \\?\C:\Users\uakta\CodeFlattener\Cargo.toml ---
+[package]
+name = "code-flattener"
+version = "0.1.2"
+edition = "2024"
+
+[dependencies]
+rayon = "1.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+glob = "0.3"
+anyhow = "1.0.98"
+clap = { version = "4.5.40", features = ["derive", "cargo"] }
+ignore = "0.4.23"
+once_cell = "1.21.3"
+tiktoken-rs = "0.7.0"
+serde_json = "1.0.143"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "2.1"
+tempfile = "3.6"
+
+```
+
+
+```md
+# --- File: \\?\C:\Users\uakta\CodeFlattener\README.md ---
+# CodeFlattener
+
+A small, blazingly-fast Rust CLI that "flattens" a codebase into a single, uploadable text file tailored for AI code analysis (for example, uploading to AIStudio or other code-review/analysis tools).
+
+This README gives a short overview, build instructions, usage examples, and configuration notes so you can quickly integrate CodeFlattener into your workflow.
+
+## Key features
+
+- Scan one or more target directories and collect source files.
+- Filter files by extension, filename, glob patterns, or predefined "profiles" (examples: `rust`, `nextjs-ts-prisma`, `cpp-cmake`).
+- Optional path-aware WordPress profile that can use wp-cli to discover active theme/plugins.
+- Optional inclusion of current Git status and diffs.
+- Token counting support (tiktoken tokenizer) with optional GPT-4 token mode.
+- Parallel processing using Rayon for speed.
+
+## Build
+
+Requires Rust toolchain (stable). From the repository root:
+
+```powershell
+cargo build --release
+```
+
+Or to run without a release build during development:
+
+```powershell
+cargo run -- <args>
+```
+
+You can also install locally using:
+
+```powershell
+cargo install --path .
+```
+
+## Basic usage
+
+Run `code-flattener` (or `cargo run --`) with a target directory (defaults to `.`):
+
+```powershell
+cargo run -- --profile rust -o flattened.txt .
+```
+
+Common useful flags:
+
+- `--profile <name>` — use a predefined profile (`rust`, `nextjs-ts-prisma`, `cpp-cmake`, `wordpress` via plugin).
+- `--output, -o <file>` — write flattened output to a file.
+- `--markdown` — wrap file contents in Markdown code blocks for nicer display in viewers.
+- `--include-git-changes, -g` — append git status and diffs to the output.
+- `--extensions` — comma-separated list of extensions to allow (overrides profile).
+- `--allowed-filenames` — space-separated list of specific filenames to include (overrides profile).
+- `--max-size` — maximum file size in megabytes to process (default ~2 MB).
+
+For full CLI help, run:
+
+```powershell
+cargo run -- --help
+```
+
+## Configuration file
+
+CodeFlattener respects a TOML configuration file (default path: `.flattener.toml`). Example:
+
+```toml
+profile = "nextjs-ts-prisma"
+extensions = [".ts", ".tsx", ".js", ".json", ".css", ".md"]
+allowed_filenames = ["next.config.js", "schema.prisma"]
+max_size = 2.0
+include_git_changes = true
+exclude_node_modules = true
+# custom profiles may be defined in the config under `profiles` (see source for structure)
+```
+
+You can pass a specific config path with `--config <path>`.
+
+## Profiles
+
+Built-in profiles include (at time of writing):
+
+- `rust` — Rust projects (includes `.rs`, `Cargo.toml`, `Cargo.lock`, etc.)
+- `nextjs-ts-prisma` — Next.js + TypeScript + Prisma projects
+- `cpp-cmake` — C/C++ and CMake projects
+- `wordpress` — provided by a WordPress profile plugin (`src/wordpress_profile.rs`) that can:
+  - return a conservative WordPress profile, or
+  - use `wp-cli` (when present) to detect active theme/plugins and produce a path-aware profile that includes theme/plugin entry files.
+
+Custom profiles can also be defined in the TOML config and may extend built-in profiles.
+
+## How it works (brief)
+
+1. Load CLI args and optional `.flattener.toml` config.
+2. Resolve the active profile (built-in, WordPress plugin, or custom profile in config).
+3. Walk target directories (respecting include/exclude globs and directory depth).
+4. Read allowed files (subject to max size), concatenate them into a single flattened output, optionally wrapped in Markdown code blocks.
+5. Optionally append git diffs and token-counting information.
+
+See `src/main.rs` for the full implementation and the available options.
+
+## Examples
+
+Flatten the current repository using the Rust profile and write to `flattened.md` with Markdown blocks:
+
+```powershell
+cargo run -- --profile rust --markdown -o flattened.md .
+```
+
+Flatten a project and include current git diffs:
+
+```powershell
+cargo run -- --profile nextjs-ts-prisma -g -o project_flat.txt /path/to/project
+```
+
+Create a custom run overriding extensions:
+
+```powershell
+cargo run -- --extensions .py,.md -o scripts_flat.txt /path/to/repo
+```
+
+## Development notes
+
+- Source: `src/main.rs`, plugin in `src/wordpress_profile.rs`.
+- Dependencies are declared in `Cargo.toml` (rayon, tiktoken-rs, clap, ignore, serde, tracing, etc.).
+
+## License
+
+This project is licensed under the terms in `LICENSE`.
+
+## Contributing
+
+Contributions are welcome. Open issues or PRs for bugs, improvements, or feature requests.
+
+## Contact / Issues
+
+If you find a bug or want a feature, please open an issue in the repository.
+
+---
+
+Requirements coverage:
+
+- Read the project and sources: Done (inspected `src/main.rs`, `src/wordpress_profile.rs`, `Cargo.toml`).
+- Produce a revamped `README.md`: Done (this file).
+- Sanity-check build after change: Will run `cargo build` and report results.
+
+"Done" means the README was updated. Next step: run a build to validate repository still builds.
+
+## Profiles quick start
+
+- Use a built-in profile:
+  - Create a `.flattener.toml` in your project root with:
+    ```
+    [profiles.myproject]
+    profile = "rust"
+    ```
+  - Or pass --profile rust on the CLI: `code-flattener --profile rust .`
+
+- Create a custom profile that extends a built-in profile:
+  ```
+  [profiles.custom-rust-like]
+  description = "Custom profile extending the built-in rust profile"
+  profile = "rust"                  # extends built-in 'rust'
+  extensions = [".rs", ".toml", ".ron"]
+  allowed_filenames = ["Cargo.toml"]
+  include_globs = ["src/**", "examples/**"]
+  ```
+  Merge precedence: child profile values are merged into the parent; extensions and allowed_filenames are combined, and child's values are preferred where conflicts exist. If a child provides include_globs, they are merged with the parent's globs.
+
+- CLI examples:
+  - Dry run to see which files would be processed:
+    `code-flattener --profile rust --dry-run .`
+  - Include git diffs in the output:
+    `code-flattener --profile rust --include-git-changes .`
+
+- WordPress notes:
+  - When using `profile = "wordpress"`, the tool will try to use `wp-cli` if available to detect the active theme and plugins. If `wp` is not available it will fall back to filesystem scanning.
+  - To include only specific plugins or a theme, use:
+    `--wp-include-only-plugins=plugin-slug1,plugin-slug2 --wp-include-theme=theme-name`
+  - When writing include_globs on Windows, prefer forward slashes in globs (e.g., "wp-content/plugins/**") — the tool normalizes separators but this avoids surprises.
+
+```
+
+
+```rs
+# --- File: \\?\C:\Users\uakta\CodeFlattener\src\main.rs ---
+// /src/main.rs
+
+mod wordpress_profile;
+use wordpress_profile::WordPressProfilePlugin;
+
+use anyhow::{Context, Result};
+use clap::{Parser};
+use glob::Pattern;
+use ignore::WalkBuilder;
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use tiktoken_rs::p50k_base;
+use tracing::{Level, debug, info, warn};
+use tracing_subscriber::FmtSubscriber;
+
+// Configuration file structure
+#[derive(Debug, Deserialize)]
+struct ConfigFile {
+    profile: Option<String>,
+    extensions: Option<Vec<String>>,
+    allowed_filenames: Option<Vec<String>>,
+    max_size: Option<f64>,
+    markdown: Option<bool>,
+    gpt4_tokens: Option<bool>,
+    include_git_changes: Option<bool>,
+    no_staged_diff: Option<bool>,
+    no_unstaged_diff: Option<bool>,
+    include_dirs: Option<Vec<PathBuf>>,
+    exclude_dirs: Option<Vec<PathBuf>>,
+    exclude_patterns: Option<Vec<String>>,
+    include_patterns: Option<Vec<String>>,
+    exclude_globs: Option<Vec<String>>,
+    include_globs: Option<Vec<String>>,
+    exclude_node_modules: Option<bool>,
+    exclude_build_dirs: Option<bool>,
+    exclude_hidden_dirs: Option<bool>,
+    max_depth: Option<usize>,
+
+    // Custom profiles section
+    profiles: Option<std::collections::HashMap<String, CustomProfile>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CustomProfile {
+    description: Option<String>,
+    #[serde(alias = "profile")]
+    extends: Option<String>,
+    extensions: Option<Vec<String>>,
+    allowed_filenames: Option<Vec<String>>,
+    include_globs: Option<Vec<String>>,
+    markdown: Option<bool>,
+}
+
+// Plugin trait for custom profiles
+trait ProfilePlugin {
+    fn get_profile(&self, name: &str) -> Option<Profile>;
+    fn list_profiles(&self) -> Vec<String>;
+}
+
+// Default profile plugin using built-in profiles
+struct DefaultProfilePlugin;
+impl ProfilePlugin for DefaultProfilePlugin {
+    fn get_profile(&self, name: &str) -> Option<Profile> {
+        PROFILES.get(name).cloned()
+    }
+
+    fn list_profiles(&self) -> Vec<String> {
+        PROFILES.keys().map(|s| s.to_string()).collect()
+    }
+}
+
+// Composite plugin that consults WordPress plugin first, then defaults
+struct CompositeProfilePlugin {
+    default: DefaultProfilePlugin,
+    wordpress: WordPressProfilePlugin,
+}
+
+impl CompositeProfilePlugin {
+    fn new() -> Self {
+        CompositeProfilePlugin {
+            default: DefaultProfilePlugin,
+            wordpress: WordPressProfilePlugin,
+        }
+    }
+}
+
+impl ProfilePlugin for CompositeProfilePlugin {
+    fn get_profile(&self, name: &str) -> Option<Profile> {
+        // Prefer wordpress plugin when asked, otherwise fall back to defaults
+        self.wordpress
+            .get_profile(name)
+            .or_else(|| self.default.get_profile(name))
+    }
+
+    fn list_profiles(&self) -> Vec<String> {
+        let mut profiles = self.default.list_profiles();
+        for p in self.wordpress.list_profiles() {
+            if !profiles.contains(&p) {
+                profiles.push(p);
+            }
+        }
+        profiles.sort();
+        profiles
+    }
+}
+
+// Lazily initialized static map of predefined profiles
+static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    m.insert(
+        "nextjs-ts-prisma",
+        Profile {
+            description: "Next.js, TypeScript, Prisma project files.".to_string(),
+            allowed_extensions: vec![
+                ".ts".to_string(),
+                ".tsx".to_string(),
+                ".js".to_string(),
+                ".jsx".to_string(),
+                ".json".to_string(),
+                ".css".to_string(),
+                ".scss".to_string(),
+                ".sass".to_string(),
+                ".less".to_string(),
+                ".html".to_string(),
+                ".htm".to_string(),
+                ".md".to_string(),
+                ".mdx".to_string(),
+                ".graphql".to_string(),
+                ".gql".to_string(),
+                ".env".to_string(),
+                ".env.local".to_string(),
+                ".env.development".to_string(),
+                ".env.production".to_string(),
+                ".yml".to_string(),
+                ".yaml".to_string(),
+                ".xml".to_string(),
+                ".toml".to_string(),
+                ".ini".to_string(),
+                ".vue".to_string(),
+                ".svelte".to_string(),
+                ".prisma".to_string(),
+            ],
+            allowed_filenames: vec![
+                "next.config.js".to_string(),
+                "tailwind.config.js".to_string(),
+                "postcss.config.js".to_string(),
+                "middleware.ts".to_string(),
+                "middleware.js".to_string(),
+                "schema.prisma".to_string(),
+            ],
+            include_globs: Vec::new(),
+            markdown: None,
+        },
+    );
+    m.insert(
+        "cpp-cmake",
+        Profile {
+            description: "C/C++ and CMake project files.".to_string(),
+            allowed_extensions: vec![
+                ".c".to_string(), ".cpp".to_string(), ".cc".to_string(), ".cxx".to_string(), ".h".to_string(), ".hpp".to_string(), ".hh".to_string(), ".ino".to_string(), ".cmake".to_string(), ".txt".to_string(), ".md".to_string(),
+                ".json".to_string(), ".xml".to_string(), ".yml".to_string(), ".yaml".to_string(), ".ini".to_string(), ".proto".to_string(), ".fbs".to_string(),
+            ],
+            allowed_filenames: vec!["CMakeLists.txt".to_string()],
+            include_globs: Vec::new(),
+            markdown: None,
+        },
+    );
+    m.insert(
+        "rust",
+        Profile {
+            description: "Rust project files.".to_string(),
+            allowed_extensions: vec![
+                ".rs".to_string(), ".toml".to_string(), ".md".to_string(), ".yml".to_string(), ".yaml".to_string(), ".sh".to_string(), ".json".to_string(), ".html".to_string(),
+            ],
+            allowed_filenames: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string(), "build.rs".to_string(), ".rustfmt.toml".to_string()],
+            include_globs: Vec::new(),
+            markdown: None,
+        },
+    );
+    m
+});
+
+#[derive(Debug, Clone)]
+struct Profile {
+    description: String,
+    allowed_extensions: Vec<String>,
+    allowed_filenames: Vec<String>,
+    include_globs: Vec<String>,
+    markdown: Option<bool>,
+}
+
+impl Profile {
+    fn new(description: String, allowed_extensions: Vec<String>, allowed_filenames: Vec<String>) -> Self {
+        Self {
+            description,
+            allowed_extensions,
+            allowed_filenames,
+            include_globs: Vec::new(),
+            markdown: None,
+        }
+    }
+
+    fn merge_with(&self, other: &Profile) -> Profile {
+        let mut merged_extensions = self.allowed_extensions.clone();
+        let mut merged_filenames = self.allowed_filenames.clone();
+
+        for ext in &other.allowed_extensions {
+            if !merged_extensions.contains(ext) {
+                merged_extensions.push(ext.clone());
+            }
+        }
+
+        for filename in &other.allowed_filenames {
+            if !merged_filenames.contains(filename) {
+                merged_filenames.push(filename.clone());
+            }
+        }
+
+        let mut merged_include_globs = self.include_globs.clone();
+        for glob in &other.include_globs {
+            if !merged_include_globs.contains(glob) {
+                merged_include_globs.push(glob.clone());
+            }
+        }
+
+        Profile {
+            description: other.description.clone(), // Use the child's description
+            allowed_extensions: merged_extensions,
+            allowed_filenames: merged_filenames,
+            include_globs: merged_include_globs,
+            markdown: other.markdown.or(self.markdown),
+        }
+    }
+}
+ 
+fn resolve_custom_profile(
+    name: &str,
+    custom_profiles: &HashMap<String, CustomProfile>,
+    plugin: &dyn ProfilePlugin,
+) -> Result<Profile> {
+    info!("Resolving custom profile '{}'", name);
+    // Lookup custom profile by name
+    let custom = custom_profiles
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("Custom profile '{}' not found", name))?;
+ 
+    // Resolve parent if present (either built-in or another custom)
+    let parent_profile: Option<Profile> = if let Some(parent_name) = &custom.extends {
+        info!("Custom profile '{}' extends '{}'", name, parent_name);
+        if custom_profiles.contains_key(parent_name) {
+            Some(resolve_custom_profile(parent_name, custom_profiles, plugin)?)
+        } else if let Some(built) = plugin.get_profile(parent_name.as_str()) {
+            Some(built)
+        } else {
+            return Err(anyhow::anyhow!("Cannot resolve parent profile '{}'", parent_name));
+        }
+    } else {
+        None
+    };
+ 
+    // Build child profile from custom definition
+    let mut child = Profile::new(
+        custom
+            .description
+            .clone()
+            .unwrap_or_else(|| name.to_string()),
+        custom.extensions.clone().unwrap_or_default(),
+        custom.allowed_filenames.clone().unwrap_or_default(),
+    );
+
+    child.include_globs = custom.include_globs.clone().unwrap_or_default();
+    child.markdown = custom.markdown;
+ 
+    // Merge parent (if any) with child, giving child's values precedence where applicable
+    Ok(match parent_profile {
+        Some(p) => {
+            info!("Merging custom profile '{}' with parent profile", name);
+            p.merge_with(&child)
+        }
+        None => child,
+    })
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "A blazingly fast code flattener, written in Rust.",
+    long_about = "Flattens code files from directories, filters by extension, and counts tokens, with profile support."
+)]
+struct Args {
+    /// One or more directories to scan. Defaults to current directory.
+    #[arg(default_value = ".")]
+    target_dirs: Vec<PathBuf>,
+
+    /// Output file path for the flattened code. If not specified, prints to console.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Use a predefined profile for a specific project type.
+    #[arg(short, long)]
+    profile: Option<String>,
+
+    /// List all available profiles and their descriptions.
+    #[arg(long)]
+    list_profiles: bool,
+
+    /// Comma-separated list of allowed file extensions (overrides profile).
+    #[arg(short, long, value_delimiter = ',', use_value_delimiter = true)]
+    extensions: Option<Vec<String>>,
+
+    /// Space-separated list of specific filenames to include (overrides profile).
+    #[arg(short, long, value_delimiter = ' ')]
+    allowed_filenames: Option<Vec<String>>,
+
+    /// Maximum file size to process in megabytes (MB).
+    #[arg(long, default_value_t = 2.0)]
+    max_size: f64,
+
+    /// Format the output content using Markdown code blocks.
+    #[arg(long, action = clap::ArgAction::Count)]
+    markdown: u8,
+
+    /// Use GPT-4 tokenizer for more accurate token counting.
+    #[arg(long)]
+    gpt4_tokens: bool,
+
+    /// Append a section with current Git status and diffs.
+    #[arg(short = 'g', long = "include-git-changes")]
+    include_git_changes: bool,
+
+    /// Do NOT include staged changes (git diff --staged).
+    #[arg(long, requires = "include_git_changes")]
+    no_staged_diff: bool,
+
+    /// Do NOT include unstaged changes (git diff).
+    #[arg(long, requires = "include_git_changes")]
+    no_unstaged_diff: bool,
+
+    /// Print verbose output during processing.
+    #[arg(short, long)]
+    verbose: bool,
+
+    /// Configuration file path
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+
+    /// Comma-separated list of directories to include (relative to target)
+    #[arg(long, value_delimiter = ',')]
+    include_dirs: Option<Vec<PathBuf>>,
+
+    /// Comma-separated list of directories to exclude (relative to target)
+    #[arg(long, value_delimiter = ',')]
+    exclude_dirs: Option<Vec<PathBuf>>,
+
+    /// Exclude node_modules directories (common in JS projects)
+    #[arg(long)]
+    exclude_node_modules: bool,
+
+    /// Exclude target/ and build/ directories (common in compiled projects)
+    #[arg(long)]
+    exclude_build_dirs: bool,
+
+    /// Exclude hidden directories (starting with .)
+    #[arg(long)]
+    exclude_hidden_dirs: bool,
+
+    /// Maximum directory depth to traverse
+    #[arg(long, default_value_t = 100)]
+    max_depth: usize,
+
+    /// Comma-separated list of patterns to exclude
+    #[arg(long, value_delimiter = ',')]
+    exclude_patterns: Option<Vec<String>>,
+
+    /// Comma-separated list of patterns to include
+    #[arg(long, value_delimiter = ',')]
+    include_patterns: Option<Vec<String>>,
+
+    /// Comma-separated list of glob patterns to exclude
+    #[arg(long, value_delimiter = ',')]
+    exclude_globs: Option<Vec<String>>,
+
+    /// Comma-separated list of glob patterns to include
+    #[arg(long, value_delimiter = ',')]
+    include_globs: Option<Vec<String>>,
+
+    /// Enable parallel processing
+    #[arg(long)]
+    parallel: bool,
+
+    /// Show progress bar
+    #[arg(long)]
+    progress: bool,
+
+    /// Dry run: log which files would be processed but don't read them
+    #[arg(long)]
+    dry_run: bool,
+
+    /// WordPress-profile-specific: comma-separated list of plugin slugs to exclude (e.g. woocommerce,elementor-pro)
+    #[arg(long, value_delimiter = ',', use_value_delimiter = true)]
+    wp_exclude_plugins: Option<Vec<String>>,
+
+    /// WordPress-profile-specific: comma-separated list of plugin slugs to exclusively include
+    #[arg(long, value_delimiter = ',', use_value_delimiter = true)]
+    wp_include_only_plugins: Option<Vec<String>>,
+
+    /// WordPress-profile-specific: theme to include
+    #[arg(long)]
+    wp_include_theme: Option<String>,
+}
+
+
+#[derive(Debug)]
+struct ProcessingResult {
+    content: String,
+    file_count: usize,
+    token_count: usize,
+}
+
+fn main() -> Result<()> {
+    // Initialize logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    let args = Args::parse();
+
+    if args.list_profiles {
+        list_profiles();
+        return Ok(());
+    }
+
+    // Load configuration from file if specified
+    let config = load_config(&args.config)?;
+    let mut args = merge_config_with_args(args, &config);
+
+    // Validate configuration
+    validate_config(&args)?;
+
+    let result = process_directories(&mut args, &config)?;
+
+    // Output results
+    output_results(&result, &args)?;
+
+    info!(
+        "Processing complete: {} files, {} tokens",
+        result.file_count, result.token_count
+    );
+
+    Ok(())
+}
+
+fn load_config(config_path: &Option<PathBuf>) -> Result<Option<ConfigFile>> {
+    let path = config_path
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(".flattener.toml"));
+
+    if path.exists() {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let config: ConfigFile = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        return Ok(Some(config));
+    }
+    Ok(None)
+}
+
+fn merge_config_with_args(mut args: Args, config: &Option<ConfigFile>) -> Args {
+    if let Some(config) = config {
+        if args.profile.is_none() {
+            if let Some(profile) = &config.profile {
+                // Preserve the raw profile name for dynamic/custom profiles
+                args.profile = Some(profile.clone());
+            }
+        }
+
+        // Merge other config options (simplified for brevity)
+        if let Some(exts) = &config.extensions {
+            args.extensions = Some(exts.clone());
+        }
+        if args.include_globs.is_none() {
+            args.include_globs = config.include_globs.clone();
+        }
+        if args.markdown == 0 {
+            if let Some(markdown) = config.markdown {
+                args.markdown = if markdown { 1 } else { 0 };
+            }
+        }
+    }
+    args
+}
+
+fn validate_config(args: &Args) -> Result<()> {
+    // Validate directory conflicts
+    if let (Some(include_dirs), Some(exclude_dirs)) = (&args.include_dirs, &args.exclude_dirs) {
+        for include_dir in include_dirs {
+            for exclude_dir in exclude_dirs {
+                if exclude_dir.starts_with(include_dir) {
+                    return Err(anyhow::anyhow!(
+                        "Conflict: exclude directory '{}' is within include directory '{}'",
+                        exclude_dir.display(),
+                        include_dir.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    // Validate max size
+    if args.max_size > 100.0 {
+        return Err(anyhow::anyhow!("Max file size cannot exceed 100MB"));
+    }
+
+    Ok(())
+}
+fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<ProcessingResult> {
+    apply_profile_settings(args, config)?;
+ 
+    // Debug log the effective profile-derived settings so we can diagnose missing files (helps on Windows where globs
+    // may use forward slashes).
+    info!(
+        "Effective profile settings - extensions: {:?}, allowed_filenames: {:?}, include_globs: {:?}, max_size: {}MB",
+        args.extensions, args.allowed_filenames, args.include_globs, args.max_size
+    );
+ 
+    let mut extensions: HashSet<String> = HashSet::new();
+    if let Some(exts) = &args.extensions {
+        extensions = exts
+            .iter()
+            .map(|e| if e.starts_with('.') { e.clone() } else { format!(".{}", e) })
+            .collect();
+    }
+    let mut allowed_filenames: HashSet<String> = HashSet::new();
+    if let Some(files) = &args.allowed_filenames {
+        allowed_filenames = files.iter().cloned().collect();
+    }
+
+    if extensions.is_empty() && allowed_filenames.is_empty() && args.include_globs.is_none() {
+        return Err(anyhow::anyhow!(
+            "No allowed extensions, filenames, or include globs specified"
+        ));
+    }
+
+    let max_file_size = (args.max_size * 1024.0 * 1024.0) as u64;
+    let all_contents = Arc::new(Mutex::new(String::new()));
+    let file_count = Arc::new(Mutex::new(0));
+
+    info!("Starting code flattening");
+    debug!("Target directories: {:?}", args.target_dirs);
+    debug!("Allowed extensions: {:?}", extensions);
+    debug!("Max file size: {:.2} MB", args.max_size);
+
+    for start_dir in &args.target_dirs {
+        let start_dir = fs::canonicalize(start_dir)
+            .with_context(|| format!("Failed to canonicalize path: {}", start_dir.display()))?;
+
+        if !is_safe_path(&start_dir, &start_dir) {
+            return Err(anyhow::anyhow!(
+                "Path traversal detected: {}",
+                start_dir.display()
+            ));
+        }
+
+        let walker = build_walker(&start_dir, args);
+        let entries: Vec<_> = walker.build().filter_map(Result::ok).collect();
+
+        if args.parallel {
+            process_entries_parallel(
+                &entries,
+                &start_dir,
+                &extensions,
+                &allowed_filenames,
+                max_file_size,
+                args,
+                &all_contents,
+                &file_count,
+            )?;
+        } else {
+            process_entries_sequential(
+                &entries,
+                &start_dir,
+                &extensions,
+                &allowed_filenames,
+                max_file_size,
+                args,
+                &all_contents,
+                &file_count,
+            )?;
+        }
+    }
+
+    // If dry-run, do not fetch git diffs or assemble file contents.
+    // We still rely on process_single_file to have incremented file_count.
+    let content = if args.dry_run {
+        // Do not collect git changes or file contents in dry-run.
+        String::new()
+    } else {
+        let mut git_output = String::new();
+        if args.include_git_changes {
+            if let Ok(Some(root)) =
+                find_git_root(args.target_dirs.first().unwrap_or(&PathBuf::from(".")))
+            {
+                if let Ok(Some(output)) = get_git_changes(
+                    &root,
+                    !args.no_staged_diff,
+                    !args.no_unstaged_diff,
+                    args.verbose,
+                ) {
+                    git_output = output;
+                }
+            }
+        }
+
+        let mut content = all_contents.lock().unwrap().clone();
+        content.push_str(&git_output);
+        content
+    };
+
+    let token_count = if args.gpt4_tokens {
+        p50k_base()
+            .unwrap()
+            .encode_with_special_tokens(&content)
+            .len()
+    } else {
+        content.split_whitespace().count()
+    };
+
+    Ok(ProcessingResult {
+        content,
+        file_count: *file_count.lock().unwrap(),
+        token_count,
+    })
+}
+
+fn build_walker(start_dir: &Path, args: &Args) -> WalkBuilder {
+    let mut walker = WalkBuilder::new(start_dir);
+
+    walker.max_depth(Some(args.max_depth));
+
+    if args.exclude_node_modules {
+        walker.filter_entry(|entry| {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            name != "node_modules"
+        });
+    }
+
+    if args.exclude_build_dirs {
+        walker.filter_entry(|entry| {
+            let path = entry.path();
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            !matches!(name.as_ref(), "target" | "build" | "dist")
+        });
+    }
+
+    if args.exclude_hidden_dirs {
+        walker.filter_entry(|entry| {
+            let path = entry.path();
+            !path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .starts_with('.')
+        });
+    }
+
+    // Add WordPress-specific exclusions
+    walker.filter_entry(|entry| {
+        let path = entry.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        name != "wp-admin" && name != "wp-includes"
+    });
+
+    walker
+}
+
+fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
+    if path.is_dir() {
+        return false;
+    }
+
+    let relative_path = match path.strip_prefix(base_dir) {
+        Ok(p) => p,
+        Err(_) => path,
+    };
+
+    // Check .flattenerignore
+    if is_ignored_by_file(path, base_dir) {
+        return false;
+    }
+
+    // Check directory inclusions/exclusions
+    if let Some(exclude_dirs) = &args.exclude_dirs {
+        for exclude_dir in exclude_dirs {
+            if relative_path.starts_with(exclude_dir) {
+                return false;
+            }
+        }
+    }
+
+    if let Some(include_dirs) = &args.include_dirs {
+        let mut included = false;
+        for include_dir in include_dirs {
+            if relative_path.starts_with(include_dir) {
+                included = true;
+                break;
+            }
+        }
+        if !included {
+            return false;
+        }
+    }
+
+    // Check glob patterns
+    if let Some(exclude_globs) = &args.exclude_globs {
+        for pattern in exclude_globs {
+            // Normalize pattern for the host OS (allow toml patterns like "src/*" to work on Windows).
+            let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+            if let Ok(glob_pattern) = Pattern::new(&pat_os) {
+                if glob_pattern.matches_path(relative_path) {
+                    return false;
+                }
+                // Also try matching against a forward-slash-normalized path string as a fallback.
+                let rel_forward = relative_path.to_string_lossy().replace('\\', "/");
+                if glob_pattern.matches_path(std::path::Path::new(&rel_forward)) {
+                    return false;
+                }
+            } else if let Ok(glob_pattern) = Pattern::new(pattern) {
+                if glob_pattern.matches_path(relative_path) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if let Some(include_globs) = &args.include_globs {
+        let mut included = false;
+        for pattern in include_globs {
+            // Normalize pattern to account for Windows path separators in TOML authored globs.
+            let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+            if let Ok(glob_pattern) = Pattern::new(&pat_os) {
+                if glob_pattern.matches_path(relative_path) {
+                    included = true;
+                    break;
+                }
+                // Fallback: try matching against a forward-slash-normalized string path
+                let rel_forward = relative_path.to_string_lossy().replace('\\', "/");
+                if glob_pattern.matches_path(std::path::Path::new(&rel_forward)) {
+                    included = true;
+                    break;
+                }
+            } else if let Ok(glob_pattern) = Pattern::new(pattern) {
+                if glob_pattern.matches_path(relative_path) {
+                    included = true;
+                    break;
+                }
+            }
+        }
+        if !included {
+            return false;
+        }
+    }
+
+    // WordPress-profile specific: exclude plugins specified via --wp-exclude-plugins
+    if let Some(excludes) = &args.wp_exclude_plugins {
+        if let Ok(rel) = path.strip_prefix(base_dir) {
+            // Normalize the relative path to lowercase for slug matching
+            let rel_str = rel.to_string_lossy().to_lowercase();
+            for raw in excludes {
+                // Normalize exclude entries (allow values like "woocommerce/packages/..." or "Woocommerce")
+                let slug = raw.split('/').next().unwrap_or(raw).to_lowercase();
+                let plugin_prefix = format!("wp-content/plugins/{}", slug);
+                if rel_str.starts_with(&plugin_prefix) {
+                    if args.verbose {
+                        info!("Excluding plugin '{}' path: {}", raw, rel.display());
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Check if file is binary (skip binary files)
+    if is_binary_file(path) {
+        return false;
+    }
+
+    // WordPress-profile specific: if --wp-include-only-plugins or --wp-include-theme is used,
+    // we should ONLY include those directories and wp-config.php.
+    if args.profile.as_deref() == Some("wordpress")
+        && (args.wp_include_only_plugins.is_some() || args.wp_include_theme.is_some())
+    {
+        if let Ok(rel) = path.strip_prefix(base_dir) {
+            let rel_str_lower = rel.to_string_lossy().to_lowercase();
+
+            // Always allow wp-config.php
+            if rel_str_lower == "wp-config.php" {
+                return true;
+            }
+
+            // Check if path is inside one of the included plugins
+            if let Some(includes) = &args.wp_include_only_plugins {
+                for raw in includes {
+                    let slug = raw.split('/').next().unwrap_or(raw).to_lowercase();
+                    let plugin_prefix = format!("wp-content/plugins/{}", slug);
+                    if rel_str_lower.starts_with(&plugin_prefix) {
+                        return true;
+                    }
+                }
+            }
+
+            // Check if path is inside the included theme
+            if let Some(theme_name) = &args.wp_include_theme {
+                let theme_prefix = format!("wp-content/themes/{}", theme_name.to_lowercase());
+                if rel_str_lower.starts_with(&theme_prefix) {
+                    return true;
+                }
+            }
+
+            // If we are here, the path is not in any of the allowed include lists, so deny it.
+            return false;
+        } else {
+            // If we can't get a relative path, deny it to be safe.
+            return false;
+        }
+    }
+
+    // For WordPress profile, exclude common core WordPress files
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        let core_wp_files = [
+            "xmlrpc.php",
+            "wp-activate.php",
+            "wp-cron.php",
+            "wp-load.php",
+            "wp-blog-header.php",
+            "wp-settings.php",
+            "wp-login.php",
+            "wp-signup.php",
+            "wp-trackback.php",
+            "wp-comments-post.php",
+            "wp-links-opml.php",
+            "wp-mail.php",
+        ];
+
+        if core_wp_files.contains(&file_name) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn is_ignored_by_file(path: &Path, base_dir: &Path) -> bool {
+    let ignore_patterns = load_ignore_patterns();
+    let relative_path = match path.strip_prefix(base_dir) {
+        Ok(p) => p,
+        Err(_) => path,
+    };
+
+    ignore_patterns
+        .iter()
+        .any(|pattern| pattern.matches_path(relative_path))
+}
+
+fn load_ignore_patterns() -> Vec<Pattern> {
+    let mut patterns = Vec::new();
+    if let Ok(content) = fs::read_to_string(".flattenerignore") {
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.is_empty() && !line.starts_with('#') {
+                if let Ok(pattern) = Pattern::new(line) {
+                    patterns.push(pattern);
+                }
+            }
+        }
+    }
+    patterns
+}
+
+fn is_binary_file(path: &Path) -> bool {
+    // Check file extension for known binary files
+    if let Some(ext) = path.extension() {
+        let ext_str = ext.to_string_lossy().to_lowercase();
+        let binary_extensions = [
+            "png", "jpg", "jpeg", "gif", "ico", "webp", "svg", "bmp", "tiff", "tif", "mp4", "avi",
+            "mov", "wmv", "flv", "webm", "mkv", "mp3", "wav", "ogg", "zip", "tar", "gz", "bz2",
+            "7z", "rar", "pdf", "doc", "docx", "xls", "xlsx", "exe", "dll", "so", "dylib", "woff",
+            "woff2", "ttf", "eot",
+        ];
+
+        if binary_extensions.contains(&ext_str.as_str()) {
+            return true;
+        }
+    }
+
+    // For files without extensions or unknown extensions, try to detect by reading first 1024 bytes
+    if let Ok(mut file) = fs::File::open(path) {
+        let mut buffer = [0u8; 1024];
+        if let Ok(bytes_read) = file.read(&mut buffer) {
+            // Check for null bytes or non-printable characters
+            for &byte in &buffer[..bytes_read] {
+                if byte == 0 || (byte < 32 && byte != 9 && byte != 10 && byte != 13) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn process_entries_parallel(
+    entries: &[ignore::DirEntry],
+    start_dir: &Path,
+    extensions: &HashSet<String>,
+    allowed_filenames: &HashSet<String>,
+    max_file_size: u64,
+    args: &Args,
+    all_contents: &Arc<Mutex<String>>,
+    file_count: &Arc<Mutex<usize>>,
+) -> Result<()> {
+    entries.par_iter().for_each(|entry| {
+        let path = entry.path();
+
+        if !should_process_path(path, args, start_dir) {
+            return;
+        }
+
+        if let Err(e) = process_single_file(
+            path,
+            extensions,
+            allowed_filenames,
+            max_file_size,
+            args,
+            all_contents,
+            file_count,
+        ) {
+            warn!("Failed to process {}: {}", path.display(), e);
+        }
+    });
+    Ok(())
+}
+
+fn process_entries_sequential(
+    entries: &[ignore::DirEntry],
+    start_dir: &Path,
+    extensions: &HashSet<String>,
+    allowed_filenames: &HashSet<String>,
+    max_file_size: u64,
+    args: &Args,
+    all_contents: &Arc<Mutex<String>>,
+    file_count: &Arc<Mutex<usize>>,
+) -> Result<()> {
+    for entry in entries {
+        let path = entry.path();
+
+        if !should_process_path(path, args, start_dir) {
+            continue;
+        }
+
+        process_single_file(
+            path,
+            extensions,
+            allowed_filenames,
+            max_file_size,
+            args,
+            all_contents,
+            file_count,
+        )?;
+    }
+    Ok(())
+}
+
+fn process_single_file(
+    path: &Path,
+    extensions: &HashSet<String>,
+    allowed_filenames: &HashSet<String>,
+    max_file_size: u64,
+    args: &Args,
+    all_contents: &Arc<Mutex<String>>,
+    file_count: &Arc<Mutex<usize>>,
+) -> Result<()> {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let extension = path.extension().unwrap_or_default().to_string_lossy();
+
+    let is_allowed_ext = extensions.contains(&format!(".{}", extension));
+    let is_allowed_file = allowed_filenames.contains(file_name.as_ref());
+
+    // If the caller provided include_globs (and the file reached this point via
+    // should_process_path), we should allow processing even when extensions or
+    // allowed_filenames are empty. This supports profiles that specify globs
+    // instead of extension lists (e.g. custom rust2 profile using "src/**").
+    let is_allowed_by_glob = args.include_globs.is_some();
+
+    if !is_allowed_ext && !is_allowed_file && !is_allowed_by_glob {
+        return Ok(());
+    }
+
+    // For dry-run we want to avoid any file reads. Log a single "DRY-RUN" line and
+    // increment the counter. Do not attempt metadata or content access.
+    if args.dry_run {
+        info!("DRY-RUN: would process {}", path.display());
+        let mut count = file_count.lock().unwrap();
+        *count += 1;
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("Failed to get metadata for {}", path.display()))?;
+
+    if metadata.len() > max_file_size {
+        if args.verbose {
+            info!("Skipping large file: {}", path.display());
+        }
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file {}", path.display()))?;
+
+    let file_path_str = path.to_string_lossy();
+    let mut formatted_content = if args.markdown > 0 {
+        format!("\n\n```{}\n# --- File: {} ---\n", extension, file_path_str)
+    } else {
+        format!("\n\n# --- File: {} ---\n\n", file_path_str)
+    };
+
+    formatted_content.push_str(&content);
+
+    if args.markdown > 0 {
+        formatted_content.push_str("\n```\n");
+    }
+
+    let mut all_contents = all_contents.lock().unwrap();
+    all_contents.push_str(&formatted_content);
+
+    let mut count = file_count.lock().unwrap();
+    *count += 1;
+
+    if args.verbose {
+        info!("Processed: {}", path.display());
+    }
+
+    Ok(())
+}
+
+fn output_results(result: &ProcessingResult, args: &Args) -> Result<()> {
+    if let Some(output_path) = &args.output {
+        if let Some(parent) = output_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create output directory: {}", parent.display())
+                })?;
+            }
+        }
+
+        let file = fs::File::create(output_path)
+            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        write!(writer, "{}", result.content).with_context(|| {
+            format!("Failed to write to output file: {}", output_path.display())
+        })?;
+
+        info!("Flattened code written to: {}", output_path.display());
+    } else {
+        let mut stdout = io::stdout().lock();
+        write!(stdout, "{}", result.content)?;
+    }
+
+    info!("Total files processed: {}", result.file_count);
+    info!("Approximate token count: {}", result.token_count);
+
+    Ok(())
+}
+
+fn apply_profile_settings(args: &mut Args, config: &Option<ConfigFile>) -> Result<()> {
+    if let Some(profile_name) = &args.profile.clone() {
+        let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
+        let custom_profiles = config
+            .as_ref()
+            .and_then(|c| c.profiles.as_ref())
+            .cloned()
+            .unwrap_or_default();
+
+        let profile = if custom_profiles.contains_key(profile_name) {
+            if args.verbose {
+                info!("Using custom profile '{}'", profile_name);
+            }
+            Some(resolve_custom_profile(
+                profile_name,
+                &custom_profiles,
+                plugin.as_ref(),
+            )?)
+        } else {
+            plugin.get_profile(profile_name)
+        };
+
+        if let Some(p) = profile {
+            if args.extensions.is_none() {
+                args.extensions = Some(p.allowed_extensions);
+            }
+            if args.allowed_filenames.is_none() {
+                args.allowed_filenames = Some(p.allowed_filenames);
+            }
+            // Only apply include_globs from a profile when the profile actually provides globs.
+            // An empty Vec means "no globs" and should not override absence of include_globs on args,
+            // because an empty Some(Vec::new()) would block all files later when checked.
+            if args.include_globs.is_none() && !p.include_globs.is_empty() {
+                args.include_globs = Some(p.include_globs);
+            }
+            if args.markdown == 0 {
+                if let Some(markdown) = p.markdown {
+                    args.markdown = if markdown { 1 } else { 0 };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn list_profiles() {
+    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
+    println!("Available Profiles:");
+    for name in plugin.list_profiles() {
+        if let Some(profile) = plugin.get_profile(&name) {
+            println!("  - {}: {}", name, profile.description);
+            println!("    Extensions: {}", profile.allowed_extensions.join(", "));
+            if !profile.allowed_filenames.is_empty() {
+                println!(
+                    "    Allowed Filenames: {}",
+                    profile.allowed_filenames.join(", ")
+                );
+            }
+            println!();
+        }
+    }
+}
+
+fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
+    let mut current_path = fs::canonicalize(start_path)
+        .with_context(|| format!("Failed to find canonical path for {}", start_path.display()))?;
+
+    loop {
+        if current_path.join(".git").is_dir() {
+            return Ok(Some(current_path));
+        }
+        if !current_path.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+fn get_git_changes(
+    git_repo_path: &Path,
+    include_staged: bool,
+    include_unstaged: bool,
+    verbose: bool,
+) -> Result<Option<String>> {
+    let mut output = String::new();
+    output.push_str("\n\n# --- Git Changes ---\n");
+    output.push_str(&format!("# Repository: {}\n\n", git_repo_path.display()));
+
+    let status_output = Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(git_repo_path)
+        .output()
+        .context("Failed to execute 'git status'")?;
+
+    if status_output.status.success() {
+        let stdout = String::from_utf8_lossy(&status_output.stdout);
+        if !stdout.trim().is_empty() {
+            output.push_str("## Git Status:\n```bash\n");
+            output.push_str(stdout.trim());
+            output.push_str("\n```\n\n");
+        } else {
+            output.push_str("## Git Status: No uncommitted changes.\n\n");
+        }
+    } else if verbose {
+        warn!(
+            "'git status' failed: {}",
+            String::from_utf8_lossy(&status_output.stderr)
+        );
+    }
+
+    if include_staged {
+        let diff_output = Command::new("git")
+            .args(["diff", "--staged"])
+            .current_dir(git_repo_path)
+            .output()
+            .context("Failed to execute 'git diff --staged'")?;
+
+        if diff_output.status.success() {
+            let stdout = String::from_utf8_lossy(&diff_output.stdout);
+            if !stdout.trim().is_empty() {
+                output.push_str("## Git Diff (Staged):\n```diff\n");
+                output.push_str(stdout.trim());
+                output.push_str("\n```\n\n");
+            }
+        } else if verbose {
+            warn!(
+                "'git diff --staged' failed: {}",
+                String::from_utf8_lossy(&diff_output.stderr)
+            );
+        }
+    }
+
+    if include_unstaged {
+        let diff_output = Command::new("git")
+            .args(["diff"])
+            .current_dir(git_repo_path)
+            .output()
+            .context("Failed to execute 'git diff'")?;
+
+        if diff_output.status.success() {
+            let stdout = String::from_utf8_lossy(&diff_output.stdout);
+            if !stdout.trim().is_empty() {
+                output.push_str("## Git Diff (Unstaged):\n```diff\n");
+                output.push_str(stdout.trim());
+                output.push_str("\n```\n\n");
+            }
+        } else if verbose {
+            warn!(
+                "'git diff' failed: {}",
+                String::from_utf8_lossy(&diff_output.stderr)
+            );
+        }
+    }
+
+    Ok(Some(output))
+}
+
+fn is_safe_path(path: &Path, base_dir: &Path) -> bool {
+    // Try a few prefix checks to determine whether `path` is inside `base_dir`.
+    // 1. If `path` can be stripped by the raw base_dir, it's safe (handles relative cases).
+    if path.strip_prefix(base_dir).is_ok() {
+        return true;
+    }
+
+    // 2. Canonicalize base_dir where possible and check starts_with (avoids touching candidate).
+    let base_abs = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+    if path.starts_with(&base_abs) {
+        return true;
+    }
+
+    // 3. For relative `path` values, join with canonical base and check.
+    if !path.is_absolute() {
+        let candidate = base_abs.join(path);
+        return candidate.starts_with(&base_abs);
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    #[test]
+    fn test_is_safe_path() {
+        let base_path = env::temp_dir();
+        // create a unique subdir for test
+        let temp_dir = base_path.join("codeflattener_test_tmp");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let base_path = temp_dir.as_path();
+        let safe_path = base_path.join("subdir/file.txt");
+        assert!(is_safe_path(&safe_path, base_path));
+
+        // This should be safe even if it doesn't exist yet
+        let non_existent = base_path.join("nonexistent");
+        assert!(is_safe_path(&non_existent, base_path));
+    }
+
+    #[test]
+    fn test_should_process_path() {
+        let base = env::temp_dir();
+        let temp_dir = base.join("codeflattener_test_tmp_2");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let base_path = temp_dir.as_path();
+        let file_path = base_path.join("src/main.rs");
+
+        fs::create_dir_all(base_path.join("src")).unwrap();
+        fs::write(&file_path, "fn main() {}").unwrap();
+
+        // Create a minimal Args instance for testing
+        let args = Args {
+            target_dirs: vec![base_path.to_path_buf()],
+            output: None,
+            profile: None,
+            list_profiles: false,
+            extensions: None,
+            allowed_filenames: None,
+            max_size: 2.0,
+            markdown: 0,
+            gpt4_tokens: false,
+            include_git_changes: false,
+            no_staged_diff: false,
+            no_unstaged_diff: false,
+            verbose: false,
+            config: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_node_modules: false,
+            exclude_build_dirs: false,
+            exclude_hidden_dirs: false,
+            max_depth: 100,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            parallel: false,
+            progress: false,
+            dry_run: false,
+            wp_exclude_plugins: None,
+            wp_include_only_plugins: None,
+            wp_include_theme: None,
+        };
+
+        assert!(should_process_path(&file_path, &args, base_path));
+    }
+    #[test]
+    fn test_resolve_custom_profile_merge_and_apply() {
+        use std::collections::HashMap;
+
+        // Build a custom parent profile that mirrors a built-in-ish profile
+        let mut custom_profiles: HashMap<String, CustomProfile> = HashMap::new();
+        custom_profiles.insert(
+            "parent".to_string(),
+            CustomProfile {
+                description: Some("Parent profile".to_string()),
+                extends: None,
+                extensions: Some(vec![".rs".to_string(), ".toml".to_string()]),
+                allowed_filenames: Some(vec!["Cargo.toml".to_string()]),
+                include_globs: Some(vec!["src/**".to_string()]),
+                markdown: Some(true),
+            },
+        );
+
+        // Child extends parent but adds an extension and a filename
+        custom_profiles.insert(
+            "child".to_string(),
+            CustomProfile {
+                description: Some("Child profile".to_string()),
+                extends: Some("parent".to_string()),
+                extensions: Some(vec![".ron".to_string()]),
+                allowed_filenames: Some(vec!["README.md".to_string()]),
+                include_globs: Some(vec!["examples/**".to_string()]),
+                markdown: None,
+            },
+        );
+
+        // Use the default plugin (CompositeProfilePlugin) for resolution
+        let plugin = CompositeProfilePlugin::new();
+
+        // Resolve child via resolve_custom_profile
+        let resolved = resolve_custom_profile("child", &custom_profiles, &plugin)
+            .expect("Failed to resolve custom profile");
+
+        // Parent extensions should be present and child extension should be added
+        assert!(resolved.allowed_extensions.contains(&".rs".to_string()));
+        assert!(resolved.allowed_extensions.contains(&".toml".to_string()));
+        assert!(resolved.allowed_extensions.contains(&".ron".to_string()));
+
+        // Filenames should include both parent and child entries
+        assert!(resolved.allowed_filenames.contains(&"Cargo.toml".to_string()));
+        assert!(resolved.allowed_filenames.contains(&"README.md".to_string()));
+
+        // Include globs should be merged (parent + child)
+        assert!(resolved.include_globs.contains(&"src/**".to_string()));
+        assert!(resolved.include_globs.contains(&"examples/**".to_string()));
+
+        // Now test apply_profile_settings uses resolved profile when handed via ConfigFile
+        let mut args = Args {
+            target_dirs: vec![PathBuf::from(".")],
+            output: None,
+            profile: Some("child".to_string()),
+            list_profiles: false,
+            extensions: None,
+            allowed_filenames: None,
+            max_size: 2.0,
+            markdown: 0,
+            gpt4_tokens: false,
+            include_git_changes: false,
+            no_staged_diff: false,
+            no_unstaged_diff: false,
+            verbose: false,
+            config: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_node_modules: false,
+            exclude_build_dirs: false,
+            exclude_hidden_dirs: false,
+            max_depth: 100,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            parallel: false,
+            progress: false,
+            dry_run: false,
+            wp_exclude_plugins: None,
+            wp_include_only_plugins: None,
+            wp_include_theme: None,
+        };
+
+        // Build ConfigFile with profiles populated
+        let config = ConfigFile {
+            profile: None,
+            extensions: None,
+            allowed_filenames: None,
+            max_size: None,
+            markdown: None,
+            gpt4_tokens: None,
+            include_git_changes: None,
+            no_staged_diff: None,
+            no_unstaged_diff: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            exclude_node_modules: None,
+            exclude_build_dirs: None,
+            exclude_hidden_dirs: None,
+            max_depth: None,
+            profiles: Some(custom_profiles),
+        };
+
+        // Apply profile settings (should pick up merged profile)
+        let res = apply_profile_settings(&mut args, &Some(config));
+        assert!(res.is_ok());
+
+        // After applying, args.extensions and allowed_filenames should be populated
+        let exts = args.extensions.expect("extensions should be set");
+        assert!(exts.contains(&".rs".to_string()));
+        assert!(exts.contains(&".ron".to_string()));
+
+        let files = args.allowed_filenames.expect("allowed filenames should be set");
+        assert!(files.contains(&"Cargo.toml".to_string()));
+        assert!(files.contains(&"README.md".to_string()));
+
+        // include_globs should be set because the merged profile provided globs
+        assert!(args.include_globs.is_some());
+        let globs = args.include_globs.unwrap();
+        assert!(globs.contains(&"src/**".to_string()));
+        assert!(globs.contains(&"examples/**".to_string()));
+
+        // markdown was inherited from parent; since args.markdown was 0 and profile.markdown is true,
+        // apply_profile_settings should set args.markdown to 1
+        assert_eq!(args.markdown, 1);
+    }
+
+    #[test]
+    fn test_apply_profile_respects_existing_args() {
+        // If the CLI already provided extensions, apply_profile_settings should not overwrite them.
+        let mut args = Args {
+            target_dirs: vec![PathBuf::from(".")],
+            output: None,
+            profile: Some("rust".to_string()),
+            list_profiles: false,
+            extensions: Some(vec![".foo".to_string()]), // user provided
+            allowed_filenames: None,
+            max_size: 2.0,
+            markdown: 0,
+            gpt4_tokens: false,
+            include_git_changes: false,
+            no_staged_diff: false,
+            no_unstaged_diff: false,
+            verbose: false,
+            config: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_node_modules: false,
+            exclude_build_dirs: false,
+            exclude_hidden_dirs: false,
+            max_depth: 100,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            parallel: false,
+            progress: false,
+            dry_run: false,
+            wp_exclude_plugins: None,
+            wp_include_only_plugins: None,
+            wp_include_theme: None,
+        };
+
+        // No config file
+        let res = apply_profile_settings(&mut args, &None);
+        assert!(res.is_ok());
+
+        // Ensure the CLI-provided extensions weren't overwritten
+        assert_eq!(args.extensions.unwrap(), vec![".foo".to_string()]);
+    }
+}
+```
+
+
+```rs
+# --- File: \\?\C:\Users\uakta\CodeFlattener\src\wordpress_profile.rs ---
+// wordpress_profile.rs
+use super::{Profile, ProfilePlugin};
+use anyhow::Result;
+use std::path::PathBuf;
+use std::process::Command;
+use tracing::info;
+
+pub struct WordPressProfilePlugin;
+
+impl ProfilePlugin for WordPressProfilePlugin {
+    fn get_profile(&self, name: &str) -> Option<Profile> {
+        if name != "wordpress" {
+            return None;
+        }
+        // Return a conservative default WordPress profile
+        Some(Self::create_wordpress_profile())
+    }
+
+    fn list_profiles(&self) -> Vec<String> {
+        vec!["wordpress".to_string()]
+    }
+}
+
+impl WordPressProfilePlugin {
+    fn create_wordpress_profile() -> Profile {
+        let mut profile = Profile::new(
+            "WordPress site with active theme and plugins.".to_string(),
+            vec![
+                ".php".to_string(),
+                ".js".to_string(),
+                ".css".to_string(),
+                ".scss".to_string(),
+                ".sass".to_string(),
+                ".less".to_string(),
+                ".html".to_string(),
+                ".htm".to_string(),
+                ".md".to_string(),
+                ".mdx".to_string(),
+                ".json".to_string(),
+                ".xml".to_string(),
+                ".yml".to_string(),
+                ".yaml".to_string(),
+                ".ini".to_string(),
+                ".env".to_string(),
+                ".env.local".to_string(),
+                ".env.development".to_string(),
+                ".env.production".to_string(),
+                ".txt".to_string(),
+            ],
+            vec![
+                "wp-config.php".to_string(),
+                "wp-cli.yml".to_string(),
+                "composer.json".to_string(),
+                "package.json".to_string(),
+                "webpack.config.js".to_string(),
+                "tailwind.config.js".to_string(),
+                "postcss.config.js".to_string(),
+            ],
+        );
+        profile.include_globs = Vec::new();
+        profile.markdown = None;
+        profile
+    }
+
+    /// Build a path-aware WordPress profile using wp-cli when available.
+    pub fn get_profile_for_path(
+        &self,
+        name: &str,
+        wp_path: &std::path::Path,
+        exclude_plugins: Option<&[String]>,
+        include_only_plugins: Option<&[String]>,
+        include_theme: Option<&str>,
+    ) -> Option<Profile> {
+        if name != "wordpress" {
+            return None;
+        }
+
+        // If explicit includes provided, be permissive on extensions and scope filenames
+        if include_only_plugins.is_some() || include_theme.is_some() {
+            info!("Using explicit include profile for WordPress");
+            let allowed_extensions = vec![
+                ".php".to_string(), ".js".to_string(), ".css".to_string(), ".scss".to_string(),
+                ".sass".to_string(), ".less".to_string(), ".html".to_string(), ".htm".to_string(),
+                ".md".to_string(), ".mdx".to_string(), ".json".to_string(), ".xml".to_string(),
+                ".yml".to_string(), ".yaml".to_string(), ".ini".to_string(), ".env".to_string(),
+                ".env.local".to_string(), ".env.development".to_string(), ".env.production".to_string(),
+                ".txt".to_string(),
+            ];
+            let mut allowed_filenames: Vec<String> = vec!["wp-config.php".to_string()];
+
+            if let Some(theme_name) = include_theme {
+                let theme_dir = wp_path.join("wp-content/themes").join(theme_name);
+                for file in &["functions.php", "style.css"] {
+                    let fp = theme_dir.join(file);
+                    if fp.exists() {
+                        if let Ok(rel) = fp.strip_prefix(wp_path) {
+                            // Normalize to forward slashes to make comparisons consistent across OSes
+                            allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
+                        } else {
+                            allowed_filenames.push(fp.to_string_lossy().replace('\\', "/"));
+                        }
+                    }
+                }
+            }
+
+            let mut plugin_names = Vec::new();
+            if let Some(includes) = include_only_plugins {
+                for p in includes {
+                    plugin_names.push(p.to_string());
+                }
+            } else if let Some(excludes) = exclude_plugins {
+                let all = self.get_active_plugins().unwrap_or_default();
+                for pd in all {
+                    if let Some(n) = pd.file_name().and_then(|s| s.to_str()) {
+                        let slug = n.to_lowercase();
+                        if !excludes.iter().any(|e| e.to_lowercase() == slug) {
+                            plugin_names.push(n.to_string());
+                        }
+                    }
+                }
+            } else {
+                plugin_names = self
+                    .get_active_plugins()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                    .collect();
+            }
+
+            for plugin in plugin_names {
+                let plugin_dir = wp_path.join("wp-content/plugins").join(&plugin);
+                let main = format!("{}.php", plugin);
+                let pf = plugin_dir.join(&main);
+                if pf.exists() {
+                    if let Ok(rel) = pf.strip_prefix(wp_path) {
+                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
+                    } else {
+                        allowed_filenames.push(pf.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+            }
+
+            let mut profile = Profile::new(
+                "WordPress site with specific theme/plugins.".to_string(),
+                allowed_extensions,
+                allowed_filenames,
+            );
+            profile.include_globs = Vec::new();
+            profile.markdown = None;
+            return Some(profile);
+        }
+
+        // Default path-aware profile: detect active theme and plugins (prefer wp-cli)
+        let mut allowed_filenames: Vec<String> = vec!["wp-config.php".to_string()];
+
+        // Try to detect active theme via wp-cli in the provided path
+        info!("Running `wp theme list` in {}", wp_path.display());
+        let theme_path = if let Ok(output) = Command::new("wp")
+            .args(["theme", "list", "--format=json", "--status=active"])
+            .current_dir(wp_path)
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(themes) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+                {
+                    themes
+                        .first()
+                        .and_then(|t| t.get("name").and_then(|n| n.as_str()))
+                        .map(|n| wp_path.join("wp-content/themes").join(n))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(tdir) = theme_path {
+            for file in &["functions.php", "style.css"] {
+                let fp = tdir.join(file);
+                if fp.exists() {
+                    if let Ok(rel) = fp.strip_prefix(wp_path) {
+                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
+                    } else {
+                        allowed_filenames.push(fp.to_string_lossy().replace('\\', "/"));
+                    }
+                }
+            }
+        }
+
+        // Try to detect active plugins via wp-cli
+        let mut plugin_names: Vec<String> = if let Ok(output) = Command::new("wp")
+            .args(["plugin", "list", "--format=json", "--status=active"])
+            .current_dir(wp_path)
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(pl) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                    pl.iter()
+                        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Fallback to filesystem scan if wp-cli didn't return plugins
+        if plugin_names.is_empty() {
+            if let Ok(av) = self.get_available_plugins() {
+                plugin_names = av
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                    .collect();
+            }
+        }
+
+        // Filter and normalize plugin directories
+        let mut final_plugin_dirs = Vec::new();
+        for plugin in plugin_names.iter() {
+            let slug = plugin.split('/').next().unwrap_or(plugin).to_string();
+            if let Some(includes) = include_only_plugins {
+                if !includes.iter().any(|e| e.to_lowercase() == slug.to_lowercase()) {
+                    continue;
+                }
+            } else if let Some(excludes) = exclude_plugins {
+                if excludes.iter().any(|e| e.to_lowercase() == slug.to_lowercase()) {
+                    info!("Excluding plugin '{}' (slug {}) from profile", plugin, slug);
+                    continue;
+                }
+            }
+            final_plugin_dirs.push(wp_path.join("wp-content/plugins").join(slug));
+        }
+
+        for plugin_dir in final_plugin_dirs {
+            if let Some(name) = plugin_dir.file_name().and_then(|n| n.to_str()) {
+                let main = format!("{}.php", name);
+                let pf = plugin_dir.join(&main);
+                if pf.exists() {
+                    if let Ok(rel) = pf.strip_prefix(wp_path) {
+                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
+                    } else {
+                        allowed_filenames.push(main);
+                    }
+                }
+            }
+        }
+
+        let allowed_extensions = vec![
+            ".js".to_string(), ".css".to_string(), ".scss".to_string(), ".sass".to_string(),
+            ".less".to_string(), ".json".to_string(), ".txt".to_string(), ".md".to_string(),
+        ];
+
+        let mut profile = Profile::new(
+            "WordPress site with active theme and plugins (path-aware).".to_string(),
+            allowed_extensions,
+            allowed_filenames,
+        );
+        profile.include_globs = Vec::new();
+        profile.markdown = None;
+        Some(profile)
+    }
+
+    pub fn get_active_theme(&self) -> Result<PathBuf> {
+        if let Ok(output) = Command::new("wp")
+            .args(["theme", "list", "--format=json", "--status=active"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(themes) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                    if let Some(t) = themes.first() {
+                        if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                            return Ok(PathBuf::from("wp-content/themes").join(name));
+                        }
+                    }
+                }
+            }
+        }
+        self.get_available_themes()?.first().cloned().ok_or_else(|| anyhow::anyhow!("No themes found"))
+    }
+
+    pub fn get_active_plugins(&self) -> Result<Vec<PathBuf>> {
+        if let Ok(output) = Command::new("wp")
+            .args(["plugin", "list", "--format=json", "--status=active"])
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(plugins) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
+                    let paths = plugins
+                        .iter()
+                        .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| PathBuf::from("wp-content/plugins").join(s)))
+                        .collect();
+                    return Ok(paths);
+                }
+            }
+        }
+        self.get_available_plugins()
+    }
+
+    pub fn get_available_themes(&self) -> Result<Vec<PathBuf>> {
+        let themes_dir = PathBuf::from("wp-content/themes");
+        if !themes_dir.exists() { return Ok(Vec::new()); }
+        let mut res = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&themes_dir) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        if let Some(n) = entry.file_name().to_str() {
+                            if !n.starts_with('.') && n != "index.php" { res.push(entry.path()); }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    pub fn get_available_plugins(&self) -> Result<Vec<PathBuf>> {
+        let plugins_dir = PathBuf::from("wp-content/plugins");
+        if !plugins_dir.exists() { return Ok(Vec::new()); }
+        let mut res = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        if let Some(n) = entry.file_name().to_str() {
+                            if !n.starts_with('.') && n != "index.php" { res.push(entry.path()); }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    pub fn collect_files_recursively(&self, dir_path: &PathBuf) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        self.collect_files_recursive_helper(dir_path, &mut files)?;
+        Ok(files)
+    }
+
+    fn collect_files_recursive_helper(
+        &self,
+        dir_path: &PathBuf,
+        files: &mut Vec<String>,
+    ) -> Result<()> {
+        if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
+            if dir_name == "wp-admin" || dir_name == "wp-includes" { return Ok(()); }
+        }
+        if let Ok(entries) = std::fs::read_dir(dir_path) {
+            for entry in entries.flatten() {
+                let ep = entry.path();
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_file() {
+                        if let Some(n) = ep.file_name().and_then(|s| s.to_str()) { files.push(n.to_string()); }
+                    } else if ft.is_dir() {
+                        let _ = self.collect_files_recursive_helper(&ep, files);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn parse_wp_config(&self) -> Result<Vec<String>> {
+        let config_path = PathBuf::from("wp-config.php");
+        if !config_path.exists() { return Ok(Vec::new()); }
+        let mut files = Vec::new();
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if content.contains("DB_NAME") { files.push("wp-config.php".to_string()); }
+            if content.contains("WP_DEBUG") { files.push("wp-config.php".to_string()); }
+        }
+        Ok(files)
+    }
+
+    pub fn parse_htaccess(&self) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        let root = PathBuf::from(".htaccess");
+        if root.exists() { files.push(".htaccess".to_string()); }
+        let common = ["wp-admin/.htaccess"];
+        for c in &common { let p = PathBuf::from(c); if p.exists() { files.push(c.to_string()); } }
+        Ok(files)
+    }
+
+    pub fn parse_env_files(&self) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for p in &[".env", ".env.local", ".env.development", ".env.production"] {
+            let path = PathBuf::from(p);
+            if path.exists() { files.push(p.to_string()); }
+        }
+        Ok(files)
+    }
+
+    pub fn parse_composer_files(&self) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for f in &["composer.json", "composer.lock"] { let p = PathBuf::from(f); if p.exists() { files.push(f.to_string()); } }
+        Ok(files)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wp_cli_detection() {
+        let plugin = WordPressProfilePlugin;
+
+        let theme_result = plugin.get_active_theme();
+
+        match theme_result {
+            Ok(theme_path) => {
+                println!("✅ WP-CLI used for theme detection: {}", theme_path.display());
+                assert!(theme_path.to_string_lossy().contains("wp-content/themes"));
+            }
+            Err(e) => {
+                println!("ℹ️  Fell back to filesystem scanning for themes: {}", e);
+            }
+        }
+
+        let plugin_result = plugin.get_active_plugins();
+
+        match plugin_result {
+            Ok(plugin_paths) => {
+                println!("✅ WP-CLI used for plugin detection: {} plugins found", plugin_paths.len());
+                for path in &plugin_paths { assert!(path.to_string_lossy().contains("wp-content/plugins")); }
+            }
+            Err(e) => {
+                println!("ℹ️  Fell back to filesystem scanning for plugins: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_profile_restrictions() {
+        let plugin = WordPressProfilePlugin;
+
+        if let Some(profile) = plugin.get_profile("wordpress") {
+            let filenames: Vec<String> = profile.allowed_filenames.iter().cloned().collect();
+            let extensions: Vec<String> = profile.allowed_extensions.iter().cloned().collect();
+
+            assert!(filenames.contains(&"wp-config.php".to_string()));
+ 
+            assert!(!filenames.contains(&"wp-load.php".to_string()));
+            assert!(!filenames.contains(&"xmlrpc.php".to_string()));
+            assert!(!filenames.contains(&"wp-cron.php".to_string()));
+ 
+            // WordPress workflows typically require PHP files for plugins/themes.
+            // The profile should include ".php" so active plugin/theme PHP is processed,
+            // while core files (like xmlrpc.php) are filtered by filename checks elsewhere.
+            assert!(extensions.contains(&".php".to_string()));
+            assert!(extensions.contains(&".js".to_string()));
+            assert!(extensions.contains(&".css".to_string()));
+            assert!(!extensions.contains(&".png".to_string()));
+            assert!(!extensions.contains(&".jpg".to_string()));
+
+            println!("✅ Profile restrictions working correctly");
+            println!("   - Allowed filenames: {:?}", filenames.len());
+            println!("   - Allowed extensions: {:?}", extensions.len());
+        } else {
+            panic!("WordPress profile not found");
+        }
+    }
+    #[test]
+    fn test_get_profile_for_path_with_includes_excludes() {
+        use tempfile::tempdir;
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("wp-content/plugins/myplugin")).unwrap();
+        fs::write(root.join("wp-content/plugins/myplugin").join("myplugin.php"), "<?php // plugin ?>").unwrap();
+        fs::create_dir_all(root.join("wp-content/themes/mytheme")).unwrap();
+        fs::write(root.join("wp-content/themes/mytheme").join("functions.php"), "<?php // theme ?>").unwrap();
+        fs::write(root.join("wp-config.php"), "<?php // config ?>").unwrap();
+
+        let plugin = WordPressProfilePlugin;
+
+        // Request a profile including only a specific plugin and theme
+        let includes = Some(vec!["myplugin".to_string()]);
+        let theme = Some("mytheme");
+
+        let profile = plugin
+            .get_profile_for_path("wordpress", root, None, includes.as_ref().map(|v| v.as_slice()), theme)
+            .expect("Expected a profile");
+
+        // Ensure wp-config.php is included
+        assert!(profile.allowed_filenames.iter().any(|f| f.ends_with("wp-config.php")));
+
+        // Ensure plugin main file is included (relative path)
+        assert!(profile
+            .allowed_filenames
+            .iter()
+            .any(|f| f.to_lowercase().contains("wp-content/plugins/myplugin")));
+
+        // Ensure theme functions.php included
+        assert!(profile
+            .allowed_filenames
+            .iter()
+            .any(|f| f.to_lowercase().contains("wp-content/themes/mytheme/functions.php")));
+
+        // Clean up (tempdir will be removed automatically)
+    }
+}
+
+```
+
+
+```rs
+# --- File: \\?\C:\Users\uakta\CodeFlattener\tests\profiles_integration.rs ---
+use assert_cmd::prelude::*;
+use predicates::prelude::*;
+use std::fs::{self, File};
+use std::io::Write;
+use std::process::Command;
+use tempfile::tempdir;
+
+// This integration test creates temporary project layouts and runs the
+// code-flattener binary with different profiles to ensure expected behavior.
+
+#[test]
+fn gold_standard_profile_processes_expected_files() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let root = dir.path();
+
+    // Create a small Rust project structure
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src").join("lib.rs"), "pub fn hello() { println!(\"hi\"); }")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"temp_proj\"\n")?;
+    fs::write(root.join("Cargo.lock"), "# lockfile")?;
+
+    // Create a .flattener.toml specifying gold-standard profile
+    let conf = r#"
+[profiles.gold-standard]
+profile = "rust"
+include_globs = ["src/**", "Cargo.toml", "Cargo.lock"]
+extensions = [".rs"]
+allowed_filenames = ["Cargo.toml", "Cargo.lock"]
+"#;
+    fs::write(root.join(".flattener.toml"), conf)?;
+
+    // Run the binary with dry-run to avoid writing output files
+    let mut cmd = Command::cargo_bin("code-flattener")?;
+    cmd.current_dir(root)
+        .arg("--profile")
+        .arg("gold-standard")
+        .arg("--dry-run")
+        .arg(".");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("DRY-RUN: would process"));
+
+    dir.close()?;
+    Ok(())
+}
+
+#[test]
+fn rust2_profile_matches_src_and_cargo_files() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src"))?;
+    fs::write(root.join("src").join("main.rs"), "fn main() {}")?;
+    fs::write(root.join("Cargo.toml"), "[package]\nname=\"x\"\n")?;
+    fs::write(root.join("Cargo.lock"), "# lock")?;
+
+    let conf = r#"
+[profiles.rust2]
+include_globs = ["src/**", "Cargo.toml", "Cargo.lock"]
+max_size = 1.0
+"#;
+    fs::write(root.join(".flattener.toml"), conf)?;
+
+    let mut cmd = Command::cargo_bin("code-flattener")?;
+    cmd.current_dir(root)
+        .arg("--profile")
+        .arg("rust2")
+        .arg("--dry-run")
+        .arg(".");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("DRY-RUN: would process"));
+
+    dir.close()?;
+    Ok(())
+}
+
+```
+
+
+```md
+# --- File: \\?\C:\Users\uakta\CodeFlattener\Todo.md ---
+# Development Plan & TODO
+
+This document outlines future enhancements to make the code flattener more powerful and intuitive for users.
+
+## 1. External Profile Configuration (High Priority)
+
+The current method of hardcoding profiles in a `static HashMap` is inflexible. The tool should support user-defined profiles loaded from an external file.
+
+-   **Goal:** Allow users to add or customize profiles without recompiling the application.
+-   **Proposed Solution:**
+    1.  **Config File:** Use a TOML file (e.g., `profiles.toml`).
+    2.  **Location:** Search for the config file in standard locations (e.g., user's config directory, project root). The `dirs` crate can help find platform-specific config paths.
+    3.  **Implementation:**
+        -   Use `serde` for deserializing the TOML file into structs.
+        -   At startup, load the default built-in profiles, then load and merge profiles from the user's config file, with user-defined profiles overriding defaults.
+    4.  **Dynamic CLI:** The `--profile` argument needs to be dynamically populated from the loaded profile names. This is a known challenge with `clap::value_enum` and may require using `clap::builder::PossibleValuesParser` or a similar dynamic approach instead of the derive macro.
+
+### 2. Project Type Auto-Detection
+
+-   **Goal:** Improve usability by suggesting a profile if none is provided.
+-   **Proposed Solution:**
+    -   If the `--profile` flag is omitted, scan the target directory for key indicator files (`Cargo.toml`, `package.json`, `CMakeLists.txt`, `pom.xml`, etc.).
+    -   If a likely project type is identified, either automatically apply that profile or prompt the user to confirm.
+
+### 3. Enhanced Git Integration
+
+-   **Goal:** Provide more granular control over what Git information is included.
+-   **Proposed Solution:**
+    -   Add a flag to include the output of `git log -n <count>` to show recent commit history.
+    -   Add a flag to diff against a specific branch (e.g., `main` or `develop`) instead of just local staged/unstaged changes.
+
+### 4. Code Quality & Refinements
+
+-   **Configuration Loading:** Abstract the configuration logic (profiles, overrides, etc.) into its own module (`config.rs`) to clean up `main.rs`.
+-   **Error Handling:** Improve warnings. For example, when a file can't be read, explicitly state if it's being skipped due to a non-UTF8 encoding issue.
+
+```

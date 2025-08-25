@@ -996,7 +996,13 @@ fn process_single_file(
     let is_allowed_ext = extensions.contains(&format!(".{}", extension));
     let is_allowed_file = allowed_filenames.contains(file_name.as_ref());
 
-    if !is_allowed_ext && !is_allowed_file {
+    // If the caller provided include_globs (and the file reached this point via
+    // should_process_path), we should allow processing even when extensions or
+    // allowed_filenames are empty. This supports profiles that specify globs
+    // instead of extension lists (e.g. custom rust2 profile using "src/**").
+    let is_allowed_by_glob = args.include_globs.is_some();
+
+    if !is_allowed_ext && !is_allowed_file && !is_allowed_by_glob {
         return Ok(());
     }
 
@@ -1233,10 +1239,25 @@ fn get_git_changes(
 }
 
 fn is_safe_path(path: &Path, base_dir: &Path) -> bool {
-    path.canonicalize()
-        .ok()
-        .map(|p| p.starts_with(base_dir))
-        .unwrap_or(false)
+    // Try a few prefix checks to determine whether `path` is inside `base_dir`.
+    // 1. If `path` can be stripped by the raw base_dir, it's safe (handles relative cases).
+    if path.strip_prefix(base_dir).is_ok() {
+        return true;
+    }
+
+    // 2. Canonicalize base_dir where possible and check starts_with (avoids touching candidate).
+    let base_abs = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+    if path.starts_with(&base_abs) {
+        return true;
+    }
+
+    // 3. For relative `path` values, join with canonical base and check.
+    if !path.is_absolute() {
+        let candidate = base_abs.join(path);
+        return candidate.starts_with(&base_abs);
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -1307,5 +1328,181 @@ mod tests {
         };
 
         assert!(should_process_path(&file_path, &args, base_path));
+    }
+    #[test]
+    fn test_resolve_custom_profile_merge_and_apply() {
+        use std::collections::HashMap;
+
+        // Build a custom parent profile that mirrors a built-in-ish profile
+        let mut custom_profiles: HashMap<String, CustomProfile> = HashMap::new();
+        custom_profiles.insert(
+            "parent".to_string(),
+            CustomProfile {
+                description: Some("Parent profile".to_string()),
+                extends: None,
+                extensions: Some(vec![".rs".to_string(), ".toml".to_string()]),
+                allowed_filenames: Some(vec!["Cargo.toml".to_string()]),
+                include_globs: Some(vec!["src/**".to_string()]),
+                markdown: Some(true),
+            },
+        );
+
+        // Child extends parent but adds an extension and a filename
+        custom_profiles.insert(
+            "child".to_string(),
+            CustomProfile {
+                description: Some("Child profile".to_string()),
+                extends: Some("parent".to_string()),
+                extensions: Some(vec![".ron".to_string()]),
+                allowed_filenames: Some(vec!["README.md".to_string()]),
+                include_globs: Some(vec!["examples/**".to_string()]),
+                markdown: None,
+            },
+        );
+
+        // Use the default plugin (CompositeProfilePlugin) for resolution
+        let plugin = CompositeProfilePlugin::new();
+
+        // Resolve child via resolve_custom_profile
+        let resolved = resolve_custom_profile("child", &custom_profiles, &plugin)
+            .expect("Failed to resolve custom profile");
+
+        // Parent extensions should be present and child extension should be added
+        assert!(resolved.allowed_extensions.contains(&".rs".to_string()));
+        assert!(resolved.allowed_extensions.contains(&".toml".to_string()));
+        assert!(resolved.allowed_extensions.contains(&".ron".to_string()));
+
+        // Filenames should include both parent and child entries
+        assert!(resolved.allowed_filenames.contains(&"Cargo.toml".to_string()));
+        assert!(resolved.allowed_filenames.contains(&"README.md".to_string()));
+
+        // Include globs should be merged (parent + child)
+        assert!(resolved.include_globs.contains(&"src/**".to_string()));
+        assert!(resolved.include_globs.contains(&"examples/**".to_string()));
+
+        // Now test apply_profile_settings uses resolved profile when handed via ConfigFile
+        let mut args = Args {
+            target_dirs: vec![PathBuf::from(".")],
+            output: None,
+            profile: Some("child".to_string()),
+            list_profiles: false,
+            extensions: None,
+            allowed_filenames: None,
+            max_size: 2.0,
+            markdown: 0,
+            gpt4_tokens: false,
+            include_git_changes: false,
+            no_staged_diff: false,
+            no_unstaged_diff: false,
+            verbose: false,
+            config: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_node_modules: false,
+            exclude_build_dirs: false,
+            exclude_hidden_dirs: false,
+            max_depth: 100,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            parallel: false,
+            progress: false,
+            dry_run: false,
+            wp_exclude_plugins: None,
+            wp_include_only_plugins: None,
+            wp_include_theme: None,
+        };
+
+        // Build ConfigFile with profiles populated
+        let config = ConfigFile {
+            profile: None,
+            extensions: None,
+            allowed_filenames: None,
+            max_size: None,
+            markdown: None,
+            gpt4_tokens: None,
+            include_git_changes: None,
+            no_staged_diff: None,
+            no_unstaged_diff: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            exclude_node_modules: None,
+            exclude_build_dirs: None,
+            exclude_hidden_dirs: None,
+            max_depth: None,
+            profiles: Some(custom_profiles),
+        };
+
+        // Apply profile settings (should pick up merged profile)
+        let res = apply_profile_settings(&mut args, &Some(config));
+        assert!(res.is_ok());
+
+        // After applying, args.extensions and allowed_filenames should be populated
+        let exts = args.extensions.expect("extensions should be set");
+        assert!(exts.contains(&".rs".to_string()));
+        assert!(exts.contains(&".ron".to_string()));
+
+        let files = args.allowed_filenames.expect("allowed filenames should be set");
+        assert!(files.contains(&"Cargo.toml".to_string()));
+        assert!(files.contains(&"README.md".to_string()));
+
+        // include_globs should be set because the merged profile provided globs
+        assert!(args.include_globs.is_some());
+        let globs = args.include_globs.unwrap();
+        assert!(globs.contains(&"src/**".to_string()));
+        assert!(globs.contains(&"examples/**".to_string()));
+
+        // markdown was inherited from parent; since args.markdown was 0 and profile.markdown is true,
+        // apply_profile_settings should set args.markdown to 1
+        assert_eq!(args.markdown, 1);
+    }
+
+    #[test]
+    fn test_apply_profile_respects_existing_args() {
+        // If the CLI already provided extensions, apply_profile_settings should not overwrite them.
+        let mut args = Args {
+            target_dirs: vec![PathBuf::from(".")],
+            output: None,
+            profile: Some("rust".to_string()),
+            list_profiles: false,
+            extensions: Some(vec![".foo".to_string()]), // user provided
+            allowed_filenames: None,
+            max_size: 2.0,
+            markdown: 0,
+            gpt4_tokens: false,
+            include_git_changes: false,
+            no_staged_diff: false,
+            no_unstaged_diff: false,
+            verbose: false,
+            config: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_node_modules: false,
+            exclude_build_dirs: false,
+            exclude_hidden_dirs: false,
+            max_depth: 100,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            include_globs: None,
+            parallel: false,
+            progress: false,
+            dry_run: false,
+            wp_exclude_plugins: None,
+            wp_include_only_plugins: None,
+            wp_include_theme: None,
+        };
+
+        // No config file
+        let res = apply_profile_settings(&mut args, &None);
+        assert!(res.is_ok());
+
+        // Ensure the CLI-provided extensions weren't overwritten
+        assert_eq!(args.extensions.unwrap(), vec![".foo".to_string()]);
     }
 }

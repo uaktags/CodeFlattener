@@ -9,6 +9,64 @@
 # Choose a predefined profile for specific project types
 # Available profiles: nextjs-ts-prisma, cpp-cmake, rust, wordpress
 # profile = "nextjs-ts-prisma"
+#
+# The sections below show how the built-in profiles are composed.
+# They're provided as commented "custom profiles" so you can copy, tweak,
+# and uncomment a representation of a built-in profile to create a custom
+# variant. This makes it clear how built-in profiles are built and how to
+# extend/override them.
+#
+# Example: Create a custom profile that extends the built-in `rust` profile
+# (uncomment and edit to use).
+#
+# [profiles.custom-rust-like]
+# description = "Custom profile extending the built-in rust profile with extra globs and files."
+# profile = "rust"                     # extend the built-in 'rust' profile
+# extensions = [".rs", ".toml", ".md"] # add or override extensions
+# allowed_filenames = ["Cargo.toml"]   # specific filenames to always include
+# include_globs = ["src/**", "examples/**"]
+#
+# Example: Built-in `nextjs-ts-prisma` shown as a commented custom profile.
+# (Useful to copy and customize)
+#
+# [profiles.nextjs-ts-prisma]
+# description = "Next.js, TypeScript, Prisma project files."
+# extensions = [
+#   ".ts", ".tsx", ".js", ".jsx", ".json", ".css", ".scss", ".sass", ".less",
+#   ".html", ".htm", ".md", ".mdx", ".graphql", ".gql", ".env", ".env.local",
+#   ".env.development", ".env.production", ".yml", ".yaml", ".xml", ".toml",
+#   ".ini", ".vue", ".svelte", ".prisma"
+# ]
+# allowed_filenames = ["next.config.js", "tailwind.config.js", "postcss.config.js", "schema.prisma"]
+# exclude_dirs = ["node_modules", ".next", "dist"]
+#
+# Example: Built-in `cpp-cmake` shown as a commented custom profile.
+#
+# [profiles.cpp-cmake]
+# description = "C/C++ and CMake project files."
+# extensions = [".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".ino", ".cmake", ".txt", ".md", ".json", ".xml", ".yml", ".yaml", ".ini", ".proto", ".fbs"]
+# allowed_filenames = ["CMakeLists.txt"]
+# exclude_dirs = ["build", "dist"]
+#
+# Example: Built-in `rust` shown as a commented custom profile.
+#
+# [profiles.rust]
+# description = "Rust project files."
+# extensions = [".rs", ".toml", ".md", ".yml", ".yaml", ".sh", ".json", ".html"]
+# allowed_filenames = ["Cargo.toml", "Cargo.lock", "build.rs", ".rustfmt.toml"]
+# exclude_dirs = ["target", "target/debug", "target/release"]
+#
+# Example: Built-in `wordpress` shown as a commented custom profile.
+#
+# [profiles.wordpress]
+# description = "WordPress site with active theme and plugins."
+# extensions = [".js", ".css", ".scss", ".sass", ".less", ".html", ".htm", ".md", ".mdx", ".json", ".xml", ".yml", ".yaml", ".ini", ".env", ".txt"]
+# allowed_filenames = ["wp-config.php", "wp-cli.yml", "composer.json", "package.json"]
+# exclude_dirs = ["wp-admin", "wp-includes"]
+#
+# Tip: To create a custom profile that tweaks a built-in, copy one of the
+# commented [profiles.*] blocks above, change the fields you want, then
+# uncomment that block in your .flattener.toml.
 
 # Custom profile configuration (overrides predefined profiles)
 # Uncomment and customize the sections below to create your own profile
@@ -170,6 +228,37 @@
 # allowed_filenames = ["Cargo.toml", "Cargo.lock", "build.rs"]
 # max_size = 1.0
 # gpt4_tokens = true
+
+# Gold-standard custom profile (comprehensive example)
+[profiles.gold-standard]
+description = "Gold-standard, fully-customized example profile demonstrating all supported options."
+# Extend a built-in profile to inherit sensible defaults (optional)
+profile = "rust"
+
+# Which file extensions to allow (dot-prefixed)
+extensions = [".rs", ".toml", ".md", ".yml", ".yaml", ".json", ".ron", ".lock"]
+
+# Explicit filenames to include regardless of extension
+allowed_filenames = ["Cargo.toml", "Cargo.lock", "build.rs", ".rustfmt.toml", "README.md"]
+
+# Glob patterns (relative to target dir) - supports forward slashes and ** recursion
+include_globs = ["src/**", "examples/**", "benches/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"]
+
+# Exclusions and other fine-grained controls
+exclude_dirs = ["target", "target/debug", "target/release", "dist", "build"]
+exclude_globs = ["**/*.wasm", "**/node_modules/**"]
+exclude_patterns = ["coverage", "__snapshots__"]
+
+# Other toggles
+exclude_node_modules = true
+exclude_build_dirs = true
+exclude_hidden_dirs = true
+max_depth = 20
+max_size = 2.0
+markdown = true
+gpt4_tokens = true
+include_git_changes = true
+
 
 # =============================================================================
 # ADVANCED CONFIGURATION

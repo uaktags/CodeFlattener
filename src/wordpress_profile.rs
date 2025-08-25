@@ -94,9 +94,10 @@ impl WordPressProfilePlugin {
                     let fp = theme_dir.join(file);
                     if fp.exists() {
                         if let Ok(rel) = fp.strip_prefix(wp_path) {
-                            allowed_filenames.push(rel.to_string_lossy().to_string());
+                            // Normalize to forward slashes to make comparisons consistent across OSes
+                            allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
                         } else {
-                            allowed_filenames.push(fp.to_string_lossy().to_string());
+                            allowed_filenames.push(fp.to_string_lossy().replace('\\', "/"));
                         }
                     }
                 }
@@ -132,9 +133,9 @@ impl WordPressProfilePlugin {
                 let pf = plugin_dir.join(&main);
                 if pf.exists() {
                     if let Ok(rel) = pf.strip_prefix(wp_path) {
-                        allowed_filenames.push(rel.to_string_lossy().to_string());
+                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
                     } else {
-                        allowed_filenames.push(pf.to_string_lossy().to_string());
+                        allowed_filenames.push(pf.to_string_lossy().replace('\\', "/"));
                     }
                 }
             }
@@ -181,9 +182,9 @@ impl WordPressProfilePlugin {
                 let fp = tdir.join(file);
                 if fp.exists() {
                     if let Ok(rel) = fp.strip_prefix(wp_path) {
-                        allowed_filenames.push(rel.to_string_lossy().to_string());
+                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
                     } else {
-                        allowed_filenames.push(fp.to_string_lossy().to_string());
+                        allowed_filenames.push(fp.to_string_lossy().replace('\\', "/"));
                     }
                 }
             }
@@ -243,7 +244,7 @@ impl WordPressProfilePlugin {
                 let pf = plugin_dir.join(&main);
                 if pf.exists() {
                     if let Ok(rel) = pf.strip_prefix(wp_path) {
-                        allowed_filenames.push(rel.to_string_lossy().to_string());
+                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
                     } else {
                         allowed_filenames.push(main);
                     }
@@ -445,12 +446,15 @@ mod tests {
             let extensions: Vec<String> = profile.allowed_extensions.iter().cloned().collect();
 
             assert!(filenames.contains(&"wp-config.php".to_string()));
-
+ 
             assert!(!filenames.contains(&"wp-load.php".to_string()));
             assert!(!filenames.contains(&"xmlrpc.php".to_string()));
             assert!(!filenames.contains(&"wp-cron.php".to_string()));
-
-            assert!(!extensions.contains(&".php".to_string()));
+ 
+            // WordPress workflows typically require PHP files for plugins/themes.
+            // The profile should include ".php" so active plugin/theme PHP is processed,
+            // while core files (like xmlrpc.php) are filtered by filename checks elsewhere.
+            assert!(extensions.contains(&".php".to_string()));
             assert!(extensions.contains(&".js".to_string()));
             assert!(extensions.contains(&".css".to_string()));
             assert!(!extensions.contains(&".png".to_string()));
@@ -462,5 +466,45 @@ mod tests {
         } else {
             panic!("WordPress profile not found");
         }
+    }
+    #[test]
+    fn test_get_profile_for_path_with_includes_excludes() {
+        use tempfile::tempdir;
+        use std::fs;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("wp-content/plugins/myplugin")).unwrap();
+        fs::write(root.join("wp-content/plugins/myplugin").join("myplugin.php"), "<?php // plugin ?>").unwrap();
+        fs::create_dir_all(root.join("wp-content/themes/mytheme")).unwrap();
+        fs::write(root.join("wp-content/themes/mytheme").join("functions.php"), "<?php // theme ?>").unwrap();
+        fs::write(root.join("wp-config.php"), "<?php // config ?>").unwrap();
+
+        let plugin = WordPressProfilePlugin;
+
+        // Request a profile including only a specific plugin and theme
+        let includes = Some(vec!["myplugin".to_string()]);
+        let theme = Some("mytheme");
+
+        let profile = plugin
+            .get_profile_for_path("wordpress", root, None, includes.as_ref().map(|v| v.as_slice()), theme)
+            .expect("Expected a profile");
+
+        // Ensure wp-config.php is included
+        assert!(profile.allowed_filenames.iter().any(|f| f.ends_with("wp-config.php")));
+
+        // Ensure plugin main file is included (relative path)
+        assert!(profile
+            .allowed_filenames
+            .iter()
+            .any(|f| f.to_lowercase().contains("wp-content/plugins/myplugin")));
+
+        // Ensure theme functions.php included
+        assert!(profile
+            .allowed_filenames
+            .iter()
+            .any(|f| f.to_lowercase().contains("wp-content/themes/mytheme/functions.php")));
+
+        // Clean up (tempdir will be removed automatically)
     }
 }
