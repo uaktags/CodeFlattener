@@ -1,10 +1,10 @@
-// src/main.rs
+// /src/main.rs
 
 mod wordpress_profile;
 use wordpress_profile::WordPressProfilePlugin;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser};
 use glob::Pattern;
 use ignore::WalkBuilder;
 use once_cell::sync::Lazy;
@@ -42,6 +42,20 @@ struct ConfigFile {
     exclude_build_dirs: Option<bool>,
     exclude_hidden_dirs: Option<bool>,
     max_depth: Option<usize>,
+
+    // Custom profiles section
+    profiles: Option<std::collections::HashMap<String, CustomProfile>>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct CustomProfile {
+    description: Option<String>,
+    #[serde(alias = "profile")]
+    extends: Option<String>,
+    extensions: Option<Vec<String>>,
+    allowed_filenames: Option<Vec<String>>,
+    include_globs: Option<Vec<String>>,
+    markdown: Option<bool>,
 }
 
 // Plugin trait for custom profiles
@@ -103,65 +117,71 @@ static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
     m.insert(
         "nextjs-ts-prisma",
         Profile {
-            description: "Next.js, TypeScript, Prisma project files.",
-            allowed_extensions: &[
-                ".ts",
-                ".tsx",
-                ".js",
-                ".jsx",
-                ".json",
-                ".css",
-                ".scss",
-                ".sass",
-                ".less",
-                ".html",
-                ".htm",
-                ".md",
-                ".mdx",
-                ".graphql",
-                ".gql",
-                ".env",
-                ".env.local",
-                ".env.development",
-                ".env.production",
-                ".yml",
-                ".yaml",
-                ".xml",
-                ".toml",
-                ".ini",
-                ".vue",
-                ".svelte",
-                ".prisma",
+            description: "Next.js, TypeScript, Prisma project files.".to_string(),
+            allowed_extensions: vec![
+                ".ts".to_string(),
+                ".tsx".to_string(),
+                ".js".to_string(),
+                ".jsx".to_string(),
+                ".json".to_string(),
+                ".css".to_string(),
+                ".scss".to_string(),
+                ".sass".to_string(),
+                ".less".to_string(),
+                ".html".to_string(),
+                ".htm".to_string(),
+                ".md".to_string(),
+                ".mdx".to_string(),
+                ".graphql".to_string(),
+                ".gql".to_string(),
+                ".env".to_string(),
+                ".env.local".to_string(),
+                ".env.development".to_string(),
+                ".env.production".to_string(),
+                ".yml".to_string(),
+                ".yaml".to_string(),
+                ".xml".to_string(),
+                ".toml".to_string(),
+                ".ini".to_string(),
+                ".vue".to_string(),
+                ".svelte".to_string(),
+                ".prisma".to_string(),
             ],
-            allowed_filenames: &[
-                "next.config.js",
-                "tailwind.config.js",
-                "postcss.config.js",
-                "middleware.ts",
-                "middleware.js",
-                "schema.prisma",
+            allowed_filenames: vec![
+                "next.config.js".to_string(),
+                "tailwind.config.js".to_string(),
+                "postcss.config.js".to_string(),
+                "middleware.ts".to_string(),
+                "middleware.js".to_string(),
+                "schema.prisma".to_string(),
             ],
+            include_globs: Vec::new(),
+            markdown: None,
         },
     );
     m.insert(
         "cpp-cmake",
         Profile {
-            description: "C/C++ and CMake project files.",
-            allowed_extensions: &[
-                ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hh", ".ino", ".cmake", ".txt", ".md",
-                ".json", ".xml", ".yml", ".yaml", ".ini", ".proto", ".fbs",
+            description: "C/C++ and CMake project files.".to_string(),
+            allowed_extensions: vec![
+                ".c".to_string(), ".cpp".to_string(), ".cc".to_string(), ".cxx".to_string(), ".h".to_string(), ".hpp".to_string(), ".hh".to_string(), ".ino".to_string(), ".cmake".to_string(), ".txt".to_string(), ".md".to_string(),
+                ".json".to_string(), ".xml".to_string(), ".yml".to_string(), ".yaml".to_string(), ".ini".to_string(), ".proto".to_string(), ".fbs".to_string(),
             ],
-            allowed_filenames: &["CMakeLists.txt"],
+            allowed_filenames: vec!["CMakeLists.txt".to_string()],
+            include_globs: Vec::new(),
+            markdown: None,
         },
     );
     m.insert(
         "rust",
         Profile {
-            description: "Rust project files.",
-            allowed_extensions: &[
-                ".rs", ".toml", ".md", ".yml", ".yaml", ".sh", ".json", ".html",
+            description: "Rust project files.".to_string(),
+            allowed_extensions: vec![
+                ".rs".to_string(), ".toml".to_string(), ".md".to_string(), ".yml".to_string(), ".yaml".to_string(), ".sh".to_string(), ".json".to_string(), ".html".to_string(),
             ],
-            allowed_filenames: &["Cargo.toml", "Cargo.lock", "build.rs", ".rustfmt.toml"],
+            allowed_filenames: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string(), "build.rs".to_string(), ".rustfmt.toml".to_string()],
+            include_globs: Vec::new(),
+            markdown: None,
         },
     );
     m
@@ -169,9 +189,103 @@ static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
 
 #[derive(Debug, Clone)]
 struct Profile {
-    description: &'static str,
-    allowed_extensions: &'static [&'static str],
-    allowed_filenames: &'static [&'static str],
+    description: String,
+    allowed_extensions: Vec<String>,
+    allowed_filenames: Vec<String>,
+    include_globs: Vec<String>,
+    markdown: Option<bool>,
+}
+
+impl Profile {
+    fn new(description: String, allowed_extensions: Vec<String>, allowed_filenames: Vec<String>) -> Self {
+        Self {
+            description,
+            allowed_extensions,
+            allowed_filenames,
+            include_globs: Vec::new(),
+            markdown: None,
+        }
+    }
+
+    fn merge_with(&self, other: &Profile) -> Profile {
+        let mut merged_extensions = self.allowed_extensions.clone();
+        let mut merged_filenames = self.allowed_filenames.clone();
+
+        for ext in &other.allowed_extensions {
+            if !merged_extensions.contains(ext) {
+                merged_extensions.push(ext.clone());
+            }
+        }
+
+        for filename in &other.allowed_filenames {
+            if !merged_filenames.contains(filename) {
+                merged_filenames.push(filename.clone());
+            }
+        }
+
+        let mut merged_include_globs = self.include_globs.clone();
+        for glob in &other.include_globs {
+            if !merged_include_globs.contains(glob) {
+                merged_include_globs.push(glob.clone());
+            }
+        }
+
+        Profile {
+            description: other.description.clone(), // Use the child's description
+            allowed_extensions: merged_extensions,
+            allowed_filenames: merged_filenames,
+            include_globs: merged_include_globs,
+            markdown: other.markdown.or(self.markdown),
+        }
+    }
+}
+ 
+fn resolve_custom_profile(
+    name: &str,
+    custom_profiles: &HashMap<String, CustomProfile>,
+    plugin: &dyn ProfilePlugin,
+) -> Result<Profile> {
+    info!("Resolving custom profile '{}'", name);
+    // Lookup custom profile by name
+    let custom = custom_profiles
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("Custom profile '{}' not found", name))?;
+ 
+    // Resolve parent if present (either built-in or another custom)
+    let parent_profile: Option<Profile> = if let Some(parent_name) = &custom.extends {
+        info!("Custom profile '{}' extends '{}'", name, parent_name);
+        if custom_profiles.contains_key(parent_name) {
+            Some(resolve_custom_profile(parent_name, custom_profiles, plugin)?)
+        } else if let Some(built) = plugin.get_profile(parent_name.as_str()) {
+            Some(built)
+        } else {
+            return Err(anyhow::anyhow!("Cannot resolve parent profile '{}'", parent_name));
+        }
+    } else {
+        None
+    };
+ 
+    // Build child profile from custom definition
+    let mut child = Profile::new(
+        custom
+            .description
+            .clone()
+            .unwrap_or_else(|| name.to_string()),
+        custom.extensions.clone().unwrap_or_default(),
+        custom.allowed_filenames.clone().unwrap_or_default(),
+    );
+
+    child.include_globs = custom.include_globs.clone().unwrap_or_default();
+    child.markdown = custom.markdown;
+ 
+    // Merge parent (if any) with child, giving child's values precedence where applicable
+    Ok(match parent_profile {
+        Some(p) => {
+            info!("Merging custom profile '{}' with parent profile", name);
+            p.merge_with(&child)
+        }
+        None => child,
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -191,8 +305,8 @@ struct Args {
     output: Option<PathBuf>,
 
     /// Use a predefined profile for a specific project type.
-    #[arg(short, long, value_enum)]
-    profile: Option<ProfileChoice>,
+    #[arg(short, long)]
+    profile: Option<String>,
 
     /// List all available profiles and their descriptions.
     #[arg(long)]
@@ -211,8 +325,8 @@ struct Args {
     max_size: f64,
 
     /// Format the output content using Markdown code blocks.
-    #[arg(long)]
-    markdown: bool,
+    #[arg(long, action = clap::ArgAction::Count)]
+    markdown: u8,
 
     /// Use GPT-4 tokenizer for more accurate token counting.
     #[arg(long)]
@@ -303,17 +417,6 @@ struct Args {
     wp_include_theme: Option<String>,
 }
 
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
-enum ProfileChoice {
-    #[clap(name = "nextjs-ts-prisma")]
-    NextjsTsPrisma,
-    #[clap(name = "cpp-cmake")]
-    CppCmake,
-    #[clap(name = "rust")]
-    Rust,
-    #[clap(name = "wordpress")]
-    WordPress,
-}
 
 #[derive(Debug)]
 struct ProcessingResult {
@@ -329,7 +432,7 @@ fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     if args.list_profiles {
         list_profiles();
@@ -338,12 +441,12 @@ fn main() -> Result<()> {
 
     // Load configuration from file if specified
     let config = load_config(&args.config)?;
-    let args = merge_config_with_args(args, config);
+    let mut args = merge_config_with_args(args, &config);
 
     // Validate configuration
     validate_config(&args)?;
 
-    let result = process_directories(&args)?;
+    let result = process_directories(&mut args, &config)?;
 
     // Output results
     output_results(&result, &args)?;
@@ -372,24 +475,27 @@ fn load_config(config_path: &Option<PathBuf>) -> Result<Option<ConfigFile>> {
     Ok(None)
 }
 
-fn merge_config_with_args(mut args: Args, config: Option<ConfigFile>) -> Args {
+fn merge_config_with_args(mut args: Args, config: &Option<ConfigFile>) -> Args {
     if let Some(config) = config {
         if args.profile.is_none() {
-            if let Some(profile) = config.profile {
-                args.profile = match profile.as_str() {
-                    "nextjs-ts-prisma" => Some(ProfileChoice::NextjsTsPrisma),
-                    "cpp-cmake" => Some(ProfileChoice::CppCmake),
-                    "rust" => Some(ProfileChoice::Rust),
-                    _ => None,
-                };
+            if let Some(profile) = &config.profile {
+                // Preserve the raw profile name for dynamic/custom profiles
+                args.profile = Some(profile.clone());
             }
         }
 
         // Merge other config options (simplified for brevity)
-        if let Some(exts) = config.extensions {
-            args.extensions = Some(exts);
+        if let Some(exts) = &config.extensions {
+            args.extensions = Some(exts.clone());
         }
-        // ... merge other config fields similarly
+        if args.include_globs.is_none() {
+            args.include_globs = config.include_globs.clone();
+        }
+        if args.markdown == 0 {
+            if let Some(markdown) = config.markdown {
+                args.markdown = if markdown { 1 } else { 0 };
+            }
+        }
     }
     args
 }
@@ -418,16 +524,25 @@ fn validate_config(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn process_directories(args: &Args) -> Result<ProcessingResult> {
+fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<ProcessingResult> {
+    apply_profile_settings(args, config)?;
+
     let mut extensions: HashSet<String> = HashSet::new();
+    if let Some(exts) = &args.extensions {
+        extensions = exts
+            .iter()
+            .map(|e| if e.starts_with('.') { e.clone() } else { format!(".{}", e) })
+            .collect();
+    }
+
     let mut allowed_filenames: HashSet<String> = HashSet::new();
+    if let Some(files) = &args.allowed_filenames {
+        allowed_filenames = files.iter().cloned().collect();
+    }
 
-    // Load profile settings
-    load_profile_settings(args, &mut extensions, &mut allowed_filenames)?;
-
-    if extensions.is_empty() && allowed_filenames.is_empty() {
+    if extensions.is_empty() && allowed_filenames.is_empty() && args.include_globs.is_none() {
         return Err(anyhow::anyhow!(
-            "No allowed extensions or filenames specified"
+            "No allowed extensions, filenames, or include globs specified"
         ));
     }
 
@@ -653,7 +768,7 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
 
     // WordPress-profile specific: if --wp-include-only-plugins or --wp-include-theme is used,
     // we should ONLY include those directories and wp-config.php.
-    if args.profile == Some(ProfileChoice::WordPress)
+    if args.profile.as_deref() == Some("wordpress")
         && (args.wp_include_only_plugins.is_some() || args.wp_include_theme.is_some())
     {
         if let Ok(rel) = path.strip_prefix(base_dir) {
@@ -879,7 +994,7 @@ fn process_single_file(
         .with_context(|| format!("Failed to read file {}", path.display()))?;
 
     let file_path_str = path.to_string_lossy();
-    let mut formatted_content = if args.markdown {
+    let mut formatted_content = if args.markdown > 0 {
         format!("\n\n```{}\n# --- File: {} ---\n", extension, file_path_str)
     } else {
         format!("\n\n# --- File: {} ---\n\n", file_path_str)
@@ -887,7 +1002,7 @@ fn process_single_file(
 
     formatted_content.push_str(&content);
 
-    if args.markdown {
+    if args.markdown > 0 {
         formatted_content.push_str("\n```\n");
     }
 
@@ -933,97 +1048,50 @@ fn output_results(result: &ProcessingResult, args: &Args) -> Result<()> {
     Ok(())
 }
 
-// ...existing code...
+fn apply_profile_settings(args: &mut Args, config: &Option<ConfigFile>) -> Result<()> {
+    if let Some(profile_name) = &args.profile.clone() {
+        let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
+        let custom_profiles = config
+            .as_ref()
+            .and_then(|c| c.profiles.as_ref())
+            .cloned()
+            .unwrap_or_default();
 
-fn load_profile_settings(
-    args: &Args,
-    extensions: &mut HashSet<String>,
-    allowed_filenames: &mut HashSet<String>,
-) -> Result<()> {
-    // Default composite plugin for most profiles
-    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
-
-    if let Some(profile_choice) = &args.profile {
-        let profile_key = match profile_choice {
-            ProfileChoice::NextjsTsPrisma => "nextjs-ts-prisma",
-            ProfileChoice::CppCmake => "cpp-cmake",
-            ProfileChoice::Rust => "rust",
-            ProfileChoice::WordPress => "wordpress",
+        let profile = if custom_profiles.contains_key(profile_name) {
+            if args.verbose {
+                info!("Using custom profile '{}'", profile_name);
+            }
+            Some(resolve_custom_profile(
+                profile_name,
+                &custom_profiles,
+                plugin.as_ref(),
+            )?)
+        } else {
+            plugin.get_profile(profile_name)
         };
 
-        // Special-case WordPress: prefer a path-aware profile that runs `wp` inside
-        // the target directory so active/inactive state reported by wp-cli is accurate.
-        if profile_key == "wordpress" {
-            // Use the first target directory as the WordPress site root
-            let wp_root = args
-                .target_dirs
-                .first()
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from("."));
-
-            // Directly use the concrete WordPress plugin implementation so we can
-            // call get_profile_for_path which invokes wp-cli with the correct cwd.
-            let wp_plugin = WordPressProfilePlugin;
-            if let Some(profile) = wp_plugin.get_profile_for_path(
-                "wordpress",
-                &wp_root,
-                args.wp_exclude_plugins.as_deref(),
-                args.wp_include_only_plugins.as_deref(),
-                args.wp_include_theme.as_deref(),
-            ) {
-                if args.verbose {
-                    info!(
-                        "Using 'wordpress' profile (path-aware) at {}",
-                        wp_root.display()
-                    );
-                }
-                extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
-                allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
-            } else if let Some(profile) = plugin.get_profile(profile_key) {
-                // Fallback to the composite/default behavior if path-aware profile fails
-                if args.verbose {
-                    info!("Path-aware wordpress profile failed; falling back to default profile.");
-                }
-                extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
-                allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
+        if let Some(p) = profile {
+            if args.extensions.is_none() {
+                args.extensions = Some(p.allowed_extensions);
             }
-        } else {
-            if let Some(profile) = plugin.get_profile(profile_key) {
-                if args.verbose {
-                    info!("Using '{}' profile.", profile_key);
+            if args.allowed_filenames.is_none() {
+                args.allowed_filenames = Some(p.allowed_filenames);
+            }
+            // Only apply include_globs from a profile when the profile actually provides globs.
+            // An empty Vec means "no globs" and should not override absence of include_globs on args,
+            // because an empty Some(Vec::new()) would block all files later when checked.
+            if args.include_globs.is_none() && !p.include_globs.is_empty() {
+                args.include_globs = Some(p.include_globs);
+            }
+            if args.markdown == 0 {
+                if let Some(markdown) = p.markdown {
+                    args.markdown = if markdown { 1 } else { 0 };
                 }
-                extensions.extend(profile.allowed_extensions.iter().map(|s| s.to_string()));
-                allowed_filenames.extend(profile.allowed_filenames.iter().map(|s| s.to_string()));
             }
         }
     }
-
-    if let Some(exts) = &args.extensions {
-        *extensions = exts
-            .iter()
-            .map(|e| {
-                if e.starts_with('.') {
-                    e.clone()
-                } else {
-                    format!(".{}", e)
-                }
-            })
-            .collect();
-        if args.verbose {
-            info!("Extensions overridden: {:?}", extensions);
-        }
-    }
-
-    if let Some(files) = &args.allowed_filenames {
-        *allowed_filenames = files.iter().cloned().collect();
-        if args.verbose {
-            info!("Allowed filenames overridden: {:?}", allowed_filenames);
-        }
-    }
-
     Ok(())
 }
-
 fn list_profiles() {
     let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
     println!("Available Profiles:");
@@ -1184,7 +1252,7 @@ mod tests {
             extensions: None,
             allowed_filenames: None,
             max_size: 2.0,
-            markdown: false,
+            markdown: 0,
             gpt4_tokens: false,
             include_git_changes: false,
             no_staged_diff: false,
