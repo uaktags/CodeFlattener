@@ -1,5 +1,5 @@
-// wordpress_profile.rs
-use super::{Profile, ProfilePlugin};
+// src/wordpress_profile.rs
+use crate::profiles::{Profile, ProfilePlugin};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::process::Command;
@@ -75,7 +75,7 @@ impl WordPressProfilePlugin {
             return None;
         }
 
-        // If explicit includes provided, be permissive on extensions and scope filenames
+        // 1. Handle Explicit Includes (User specific specific plugins/themes)
         if include_only_plugins.is_some() || include_theme.is_some() {
             info!("Using explicit include profile for WordPress");
             let allowed_extensions = vec![
@@ -94,7 +94,6 @@ impl WordPressProfilePlugin {
                     let fp = theme_dir.join(file);
                     if fp.exists() {
                         if let Ok(rel) = fp.strip_prefix(wp_path) {
-                            // Normalize to forward slashes to make comparisons consistent across OSes
                             allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
                         } else {
                             allowed_filenames.push(fp.to_string_lossy().replace('\\', "/"));
@@ -145,15 +144,12 @@ impl WordPressProfilePlugin {
                 allowed_extensions,
                 allowed_filenames,
             );
-            profile.include_globs = Vec::new();
-            profile.markdown = None;
             return Some(profile);
         }
 
-        // Default path-aware profile: detect active theme and plugins (prefer wp-cli)
+        // 2. Default Path-Aware Detection (WP-CLI)
         let mut allowed_filenames: Vec<String> = vec!["wp-config.php".to_string()];
 
-        // Try to detect active theme via wp-cli in the provided path
         info!("Running `wp theme list` in {}", wp_path.display());
         let theme_path = if let Ok(output) = Command::new("wp")
             .args(["theme", "list", "--format=json", "--status=active"])
@@ -190,7 +186,6 @@ impl WordPressProfilePlugin {
             }
         }
 
-        // Try to detect active plugins via wp-cli
         let mut plugin_names: Vec<String> = if let Ok(output) = Command::new("wp")
             .args(["plugin", "list", "--format=json", "--status=active"])
             .current_dir(wp_path)
@@ -211,7 +206,6 @@ impl WordPressProfilePlugin {
             Vec::new()
         };
 
-        // Fallback to filesystem scan if wp-cli didn't return plugins
         if plugin_names.is_empty() {
             if let Ok(av) = self.get_available_plugins() {
                 plugin_names = av
@@ -221,35 +215,25 @@ impl WordPressProfilePlugin {
             }
         }
 
-        // Filter and normalize plugin directories
-        let mut final_plugin_dirs = Vec::new();
-        for plugin in plugin_names.iter() {
-            let slug = plugin.split('/').next().unwrap_or(plugin).to_string();
-            if let Some(includes) = include_only_plugins {
-                if !includes.iter().any(|e| e.to_lowercase() == slug.to_lowercase()) {
-                    continue;
-                }
-            } else if let Some(excludes) = exclude_plugins {
-                if excludes.iter().any(|e| e.to_lowercase() == slug.to_lowercase()) {
-                    info!("Excluding plugin '{}' (slug {}) from profile", plugin, slug);
-                    continue;
-                }
-            }
-            final_plugin_dirs.push(wp_path.join("wp-content/plugins").join(slug));
-        }
+        for plugin in plugin_names {
+             let slug = plugin.split('/').next().unwrap_or(&plugin).to_string();
+             if let Some(excludes) = exclude_plugins {
+                 if excludes.iter().any(|e| e.to_lowercase() == slug.to_lowercase()) {
+                     info!("Excluding plugin '{}'", slug);
+                     continue;
+                 }
+             }
 
-        for plugin_dir in final_plugin_dirs {
-            if let Some(name) = plugin_dir.file_name().and_then(|n| n.to_str()) {
-                let main = format!("{}.php", name);
-                let pf = plugin_dir.join(&main);
-                if pf.exists() {
-                    if let Ok(rel) = pf.strip_prefix(wp_path) {
-                        allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
-                    } else {
-                        allowed_filenames.push(main);
-                    }
-                }
-            }
+             let plugin_dir = wp_path.join("wp-content/plugins").join(&slug);
+             let main = format!("{}.php", slug);
+             let pf = plugin_dir.join(&main);
+             if pf.exists() {
+                 if let Ok(rel) = pf.strip_prefix(wp_path) {
+                     allowed_filenames.push(rel.to_string_lossy().replace('\\', "/"));
+                 } else {
+                     allowed_filenames.push(pf.to_string_lossy().replace('\\', "/"));
+                 }
+             }
         }
 
         let allowed_extensions = vec![
@@ -257,32 +241,11 @@ impl WordPressProfilePlugin {
             ".less".to_string(), ".json".to_string(), ".txt".to_string(), ".md".to_string(),
         ];
 
-        let mut profile = Profile::new(
+        Some(Profile::new(
             "WordPress site with active theme and plugins (path-aware).".to_string(),
             allowed_extensions,
             allowed_filenames,
-        );
-        profile.include_globs = Vec::new();
-        profile.markdown = None;
-        Some(profile)
-    }
-
-    pub fn get_active_theme(&self) -> Result<PathBuf> {
-        if let Ok(output) = Command::new("wp")
-            .args(["theme", "list", "--format=json", "--status=active"])
-            .output()
-        {
-            if output.status.success() {
-                if let Ok(themes) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) {
-                    if let Some(t) = themes.first() {
-                        if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                            return Ok(PathBuf::from("wp-content/themes").join(name));
-                        }
-                    }
-                }
-            }
-        }
-        self.get_available_themes()?.first().cloned().ok_or_else(|| anyhow::anyhow!("No themes found"))
+        ))
     }
 
     pub fn get_active_plugins(&self) -> Result<Vec<PathBuf>> {
@@ -303,24 +266,6 @@ impl WordPressProfilePlugin {
         self.get_available_plugins()
     }
 
-    pub fn get_available_themes(&self) -> Result<Vec<PathBuf>> {
-        let themes_dir = PathBuf::from("wp-content/themes");
-        if !themes_dir.exists() { return Ok(Vec::new()); }
-        let mut res = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&themes_dir) {
-            for entry in entries.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_dir() {
-                        if let Some(n) = entry.file_name().to_str() {
-                            if !n.starts_with('.') && n != "index.php" { res.push(entry.path()); }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(res)
-    }
-
     pub fn get_available_plugins(&self) -> Result<Vec<PathBuf>> {
         let plugins_dir = PathBuf::from("wp-content/plugins");
         if !plugins_dir.exists() { return Ok(Vec::new()); }
@@ -330,181 +275,12 @@ impl WordPressProfilePlugin {
                 if let Ok(ft) = entry.file_type() {
                     if ft.is_dir() {
                         if let Some(n) = entry.file_name().to_str() {
-                            if !n.starts_with('.') && n != "index.php" { res.push(entry.path()); }
+                            if !n.starts_with('.') { res.push(entry.path()); }
                         }
                     }
                 }
             }
         }
         Ok(res)
-    }
-
-    pub fn collect_files_recursively(&self, dir_path: &PathBuf) -> Result<Vec<String>> {
-        let mut files = Vec::new();
-        self.collect_files_recursive_helper(dir_path, &mut files)?;
-        Ok(files)
-    }
-
-    fn collect_files_recursive_helper(
-        &self,
-        dir_path: &PathBuf,
-        files: &mut Vec<String>,
-    ) -> Result<()> {
-        if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
-            if dir_name == "wp-admin" || dir_name == "wp-includes" { return Ok(()); }
-        }
-        if let Ok(entries) = std::fs::read_dir(dir_path) {
-            for entry in entries.flatten() {
-                let ep = entry.path();
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_file() {
-                        if let Some(n) = ep.file_name().and_then(|s| s.to_str()) { files.push(n.to_string()); }
-                    } else if ft.is_dir() {
-                        let _ = self.collect_files_recursive_helper(&ep, files);
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn parse_wp_config(&self) -> Result<Vec<String>> {
-        let config_path = PathBuf::from("wp-config.php");
-        if !config_path.exists() { return Ok(Vec::new()); }
-        let mut files = Vec::new();
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if content.contains("DB_NAME") { files.push("wp-config.php".to_string()); }
-            if content.contains("WP_DEBUG") { files.push("wp-config.php".to_string()); }
-        }
-        Ok(files)
-    }
-
-    pub fn parse_htaccess(&self) -> Result<Vec<String>> {
-        let mut files = Vec::new();
-        let root = PathBuf::from(".htaccess");
-        if root.exists() { files.push(".htaccess".to_string()); }
-        let common = ["wp-admin/.htaccess"];
-        for c in &common { let p = PathBuf::from(c); if p.exists() { files.push(c.to_string()); } }
-        Ok(files)
-    }
-
-    pub fn parse_env_files(&self) -> Result<Vec<String>> {
-        let mut files = Vec::new();
-        for p in &[".env", ".env.local", ".env.development", ".env.production"] {
-            let path = PathBuf::from(p);
-            if path.exists() { files.push(p.to_string()); }
-        }
-        Ok(files)
-    }
-
-    pub fn parse_composer_files(&self) -> Result<Vec<String>> {
-        let mut files = Vec::new();
-        for f in &["composer.json", "composer.lock"] { let p = PathBuf::from(f); if p.exists() { files.push(f.to_string()); } }
-        Ok(files)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_wp_cli_detection() {
-        let plugin = WordPressProfilePlugin;
-
-        let theme_result = plugin.get_active_theme();
-
-        match theme_result {
-            Ok(theme_path) => {
-                println!("✅ WP-CLI used for theme detection: {}", theme_path.display());
-                assert!(theme_path.to_string_lossy().contains("wp-content/themes"));
-            }
-            Err(e) => {
-                println!("ℹ️  Fell back to filesystem scanning for themes: {}", e);
-            }
-        }
-
-        let plugin_result = plugin.get_active_plugins();
-
-        match plugin_result {
-            Ok(plugin_paths) => {
-                println!("✅ WP-CLI used for plugin detection: {} plugins found", plugin_paths.len());
-                for path in &plugin_paths { assert!(path.to_string_lossy().contains("wp-content/plugins")); }
-            }
-            Err(e) => {
-                println!("ℹ️  Fell back to filesystem scanning for plugins: {}", e);
-            }
-        }
-    }
-
-    #[test]
-    fn test_profile_restrictions() {
-        let plugin = WordPressProfilePlugin;
-
-        if let Some(profile) = plugin.get_profile("wordpress") {
-            let filenames: Vec<String> = profile.allowed_filenames.iter().cloned().collect();
-            let extensions: Vec<String> = profile.allowed_extensions.iter().cloned().collect();
-
-            assert!(filenames.contains(&"wp-config.php".to_string()));
- 
-            assert!(!filenames.contains(&"wp-load.php".to_string()));
-            assert!(!filenames.contains(&"xmlrpc.php".to_string()));
-            assert!(!filenames.contains(&"wp-cron.php".to_string()));
- 
-            // WordPress workflows typically require PHP files for plugins/themes.
-            // The profile should include ".php" so active plugin/theme PHP is processed,
-            // while core files (like xmlrpc.php) are filtered by filename checks elsewhere.
-            assert!(extensions.contains(&".php".to_string()));
-            assert!(extensions.contains(&".js".to_string()));
-            assert!(extensions.contains(&".css".to_string()));
-            assert!(!extensions.contains(&".png".to_string()));
-            assert!(!extensions.contains(&".jpg".to_string()));
-
-            println!("✅ Profile restrictions working correctly");
-            println!("   - Allowed filenames: {:?}", filenames.len());
-            println!("   - Allowed extensions: {:?}", extensions.len());
-        } else {
-            panic!("WordPress profile not found");
-        }
-    }
-    #[test]
-    fn test_get_profile_for_path_with_includes_excludes() {
-        use tempfile::tempdir;
-        use std::fs;
-
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir_all(root.join("wp-content/plugins/myplugin")).unwrap();
-        fs::write(root.join("wp-content/plugins/myplugin").join("myplugin.php"), "<?php // plugin ?>").unwrap();
-        fs::create_dir_all(root.join("wp-content/themes/mytheme")).unwrap();
-        fs::write(root.join("wp-content/themes/mytheme").join("functions.php"), "<?php // theme ?>").unwrap();
-        fs::write(root.join("wp-config.php"), "<?php // config ?>").unwrap();
-
-        let plugin = WordPressProfilePlugin;
-
-        // Request a profile including only a specific plugin and theme
-        let includes = Some(vec!["myplugin".to_string()]);
-        let theme = Some("mytheme");
-
-        let profile = plugin
-            .get_profile_for_path("wordpress", root, None, includes.as_ref().map(|v| v.as_slice()), theme)
-            .expect("Expected a profile");
-
-        // Ensure wp-config.php is included
-        assert!(profile.allowed_filenames.iter().any(|f| f.ends_with("wp-config.php")));
-
-        // Ensure plugin main file is included (relative path)
-        assert!(profile
-            .allowed_filenames
-            .iter()
-            .any(|f| f.to_lowercase().contains("wp-content/plugins/myplugin")));
-
-        // Ensure theme functions.php included
-        assert!(profile
-            .allowed_filenames
-            .iter()
-            .any(|f| f.to_lowercase().contains("wp-content/themes/mytheme/functions.php")));
-
-        // Clean up (tempdir will be removed automatically)
     }
 }

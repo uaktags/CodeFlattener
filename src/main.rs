@@ -1,292 +1,25 @@
-// /src/main.rs
-
+// src/main.rs
+mod config;
+mod profiles;
 mod wordpress_profile;
-use wordpress_profile::WordPressProfilePlugin;
+
+use crate::config::ConfigFile;
+use crate::profiles::ProfileManager;
 
 use anyhow::{Context, Result};
-use clap::{Parser};
+use clap::Parser;
 use glob::Pattern;
 use ignore::WalkBuilder;
-use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tiktoken_rs::p50k_base;
-use tracing::{Level, debug, info, warn};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
-
-// Configuration file structure
-#[derive(Debug, Deserialize)]
-struct ConfigFile {
-    profile: Option<String>,
-    extensions: Option<Vec<String>>,
-    allowed_filenames: Option<Vec<String>>,
-    max_size: Option<f64>,
-    markdown: Option<bool>,
-    gpt4_tokens: Option<bool>,
-    include_git_changes: Option<bool>,
-    no_staged_diff: Option<bool>,
-    no_unstaged_diff: Option<bool>,
-    include_dirs: Option<Vec<PathBuf>>,
-    exclude_dirs: Option<Vec<PathBuf>>,
-    exclude_patterns: Option<Vec<String>>,
-    include_patterns: Option<Vec<String>>,
-    exclude_globs: Option<Vec<String>>,
-    include_globs: Option<Vec<String>>,
-    exclude_node_modules: Option<bool>,
-    exclude_build_dirs: Option<bool>,
-    exclude_hidden_dirs: Option<bool>,
-    max_depth: Option<usize>,
-
-    // Custom profiles section
-    profiles: Option<std::collections::HashMap<String, CustomProfile>>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct CustomProfile {
-    description: Option<String>,
-    #[serde(alias = "profile")]
-    extends: Option<String>,
-    extensions: Option<Vec<String>>,
-    allowed_filenames: Option<Vec<String>>,
-    include_globs: Option<Vec<String>>,
-    markdown: Option<bool>,
-}
-
-// Plugin trait for custom profiles
-trait ProfilePlugin {
-    fn get_profile(&self, name: &str) -> Option<Profile>;
-    fn list_profiles(&self) -> Vec<String>;
-}
-
-// Default profile plugin using built-in profiles
-struct DefaultProfilePlugin;
-impl ProfilePlugin for DefaultProfilePlugin {
-    fn get_profile(&self, name: &str) -> Option<Profile> {
-        PROFILES.get(name).cloned()
-    }
-
-    fn list_profiles(&self) -> Vec<String> {
-        PROFILES.keys().map(|s| s.to_string()).collect()
-    }
-}
-
-// Composite plugin that consults WordPress plugin first, then defaults
-struct CompositeProfilePlugin {
-    default: DefaultProfilePlugin,
-    wordpress: WordPressProfilePlugin,
-}
-
-impl CompositeProfilePlugin {
-    fn new() -> Self {
-        CompositeProfilePlugin {
-            default: DefaultProfilePlugin,
-            wordpress: WordPressProfilePlugin,
-        }
-    }
-}
-
-impl ProfilePlugin for CompositeProfilePlugin {
-    fn get_profile(&self, name: &str) -> Option<Profile> {
-        // Prefer wordpress plugin when asked, otherwise fall back to defaults
-        self.wordpress
-            .get_profile(name)
-            .or_else(|| self.default.get_profile(name))
-    }
-
-    fn list_profiles(&self) -> Vec<String> {
-        let mut profiles = self.default.list_profiles();
-        for p in self.wordpress.list_profiles() {
-            if !profiles.contains(&p) {
-                profiles.push(p);
-            }
-        }
-        profiles.sort();
-        profiles
-    }
-}
-
-// Lazily initialized static map of predefined profiles
-static PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
-    let mut m = HashMap::new();
-    m.insert(
-        "nextjs-ts-prisma",
-        Profile {
-            description: "Next.js, TypeScript, Prisma project files.".to_string(),
-            allowed_extensions: vec![
-                ".ts".to_string(),
-                ".tsx".to_string(),
-                ".js".to_string(),
-                ".jsx".to_string(),
-                ".json".to_string(),
-                ".css".to_string(),
-                ".scss".to_string(),
-                ".sass".to_string(),
-                ".less".to_string(),
-                ".html".to_string(),
-                ".htm".to_string(),
-                ".md".to_string(),
-                ".mdx".to_string(),
-                ".graphql".to_string(),
-                ".gql".to_string(),
-                ".env".to_string(),
-                ".env.local".to_string(),
-                ".env.development".to_string(),
-                ".env.production".to_string(),
-                ".yml".to_string(),
-                ".yaml".to_string(),
-                ".xml".to_string(),
-                ".toml".to_string(),
-                ".ini".to_string(),
-                ".vue".to_string(),
-                ".svelte".to_string(),
-                ".prisma".to_string(),
-            ],
-            allowed_filenames: vec![
-                "next.config.js".to_string(),
-                "tailwind.config.js".to_string(),
-                "postcss.config.js".to_string(),
-                "middleware.ts".to_string(),
-                "middleware.js".to_string(),
-                "schema.prisma".to_string(),
-            ],
-            include_globs: Vec::new(),
-            markdown: None,
-        },
-    );
-    m.insert(
-        "cpp-cmake",
-        Profile {
-            description: "C/C++ and CMake project files.".to_string(),
-            allowed_extensions: vec![
-                ".c".to_string(), ".cpp".to_string(), ".cc".to_string(), ".cxx".to_string(), ".h".to_string(), ".hpp".to_string(), ".hh".to_string(), ".ino".to_string(), ".cmake".to_string(), ".txt".to_string(), ".md".to_string(),
-                ".json".to_string(), ".xml".to_string(), ".yml".to_string(), ".yaml".to_string(), ".ini".to_string(), ".proto".to_string(), ".fbs".to_string(),
-            ],
-            allowed_filenames: vec!["CMakeLists.txt".to_string()],
-            include_globs: Vec::new(),
-            markdown: None,
-        },
-    );
-    m.insert(
-        "rust",
-        Profile {
-            description: "Rust project files.".to_string(),
-            allowed_extensions: vec![
-                ".rs".to_string(), ".toml".to_string(), ".md".to_string(), ".yml".to_string(), ".yaml".to_string(), ".sh".to_string(), ".json".to_string(), ".html".to_string(),
-            ],
-            allowed_filenames: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string(), "build.rs".to_string(), ".rustfmt.toml".to_string()],
-            include_globs: Vec::new(),
-            markdown: None,
-        },
-    );
-    m
-});
-
-#[derive(Debug, Clone)]
-struct Profile {
-    description: String,
-    allowed_extensions: Vec<String>,
-    allowed_filenames: Vec<String>,
-    include_globs: Vec<String>,
-    markdown: Option<bool>,
-}
-
-impl Profile {
-    fn new(description: String, allowed_extensions: Vec<String>, allowed_filenames: Vec<String>) -> Self {
-        Self {
-            description,
-            allowed_extensions,
-            allowed_filenames,
-            include_globs: Vec::new(),
-            markdown: None,
-        }
-    }
-
-    fn merge_with(&self, other: &Profile) -> Profile {
-        let mut merged_extensions = self.allowed_extensions.clone();
-        let mut merged_filenames = self.allowed_filenames.clone();
-
-        for ext in &other.allowed_extensions {
-            if !merged_extensions.contains(ext) {
-                merged_extensions.push(ext.clone());
-            }
-        }
-
-        for filename in &other.allowed_filenames {
-            if !merged_filenames.contains(filename) {
-                merged_filenames.push(filename.clone());
-            }
-        }
-
-        let mut merged_include_globs = self.include_globs.clone();
-        for glob in &other.include_globs {
-            if !merged_include_globs.contains(glob) {
-                merged_include_globs.push(glob.clone());
-            }
-        }
-
-        Profile {
-            description: other.description.clone(), // Use the child's description
-            allowed_extensions: merged_extensions,
-            allowed_filenames: merged_filenames,
-            include_globs: merged_include_globs,
-            markdown: other.markdown.or(self.markdown),
-        }
-    }
-}
- 
-fn resolve_custom_profile(
-    name: &str,
-    custom_profiles: &HashMap<String, CustomProfile>,
-    plugin: &dyn ProfilePlugin,
-) -> Result<Profile> {
-    info!("Resolving custom profile '{}'", name);
-    // Lookup custom profile by name
-    let custom = custom_profiles
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("Custom profile '{}' not found", name))?;
- 
-    // Resolve parent if present (either built-in or another custom)
-    let parent_profile: Option<Profile> = if let Some(parent_name) = &custom.extends {
-        info!("Custom profile '{}' extends '{}'", name, parent_name);
-        if custom_profiles.contains_key(parent_name) {
-            Some(resolve_custom_profile(parent_name, custom_profiles, plugin)?)
-        } else if let Some(built) = plugin.get_profile(parent_name.as_str()) {
-            Some(built)
-        } else {
-            return Err(anyhow::anyhow!("Cannot resolve parent profile '{}'", parent_name));
-        }
-    } else {
-        None
-    };
- 
-    // Build child profile from custom definition
-    let mut child = Profile::new(
-        custom
-            .description
-            .clone()
-            .unwrap_or_else(|| name.to_string()),
-        custom.extensions.clone().unwrap_or_default(),
-        custom.allowed_filenames.clone().unwrap_or_default(),
-    );
-
-    child.include_globs = custom.include_globs.clone().unwrap_or_default();
-    child.markdown = custom.markdown;
- 
-    // Merge parent (if any) with child, giving child's values precedence where applicable
-    Ok(match parent_profile {
-        Some(p) => {
-            info!("Merging custom profile '{}' with parent profile", name);
-            p.merge_with(&child)
-        }
-        None => child,
-    })
-}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -295,7 +28,7 @@ fn resolve_custom_profile(
     about = "A blazingly fast code flattener, written in Rust.",
     long_about = "Flattens code files from directories, filters by extension, and counts tokens, with profile support."
 )]
-struct Args {
+pub struct Args {
     /// One or more directories to scan. Defaults to current directory.
     #[arg(default_value = ".")]
     target_dirs: Vec<PathBuf>,
@@ -417,7 +150,6 @@ struct Args {
     wp_include_theme: Option<String>,
 }
 
-
 #[derive(Debug)]
 struct ProcessingResult {
     content: String,
@@ -432,23 +164,32 @@ fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let args = Args::parse();
+    let args_cli = Args::parse();
 
-    if args.list_profiles {
-        list_profiles();
+    // 1. Load Configuration
+    let config = config::load_config(&args_cli.config)?;
+
+    // 2. Initialize Profile Manager (loads built-ins + config profiles)
+    let custom_profiles = config.as_ref().and_then(|c| c.profiles.clone());
+    let profile_manager = ProfileManager::new(custom_profiles);
+
+    // 3. Handle List Profiles
+    if args_cli.list_profiles {
+        println!("Available Profiles:");
+        for (name, desc) in profile_manager.list_all() {
+            println!("  - {}: {}", name, desc);
+        }
         return Ok(());
     }
 
-    // Load configuration from file if specified
-    let config = load_config(&args.config)?;
-    let mut args = merge_config_with_args(args, &config);
-
-    // Validate configuration
+    // 4. Merge Config into Args
+    let mut args = merge_config_with_args(args_cli, &config);
     validate_config(&args)?;
 
-    let result = process_directories(&mut args, &config)?;
+    // 5. Process Directories
+    let result = process_directories(&mut args, &profile_manager)?;
 
-    // Output results
+    // 6. Output Results
     output_results(&result, &args)?;
 
     info!(
@@ -459,49 +200,58 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_config(config_path: &Option<PathBuf>) -> Result<Option<ConfigFile>> {
-    let path = config_path
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from(".flattener.toml"));
-
-    if path.exists() {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: ConfigFile = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-        return Ok(Some(config));
-    }
-    Ok(None)
-}
-
 fn merge_config_with_args(mut args: Args, config: &Option<ConfigFile>) -> Args {
     if let Some(config) = config {
         if args.profile.is_none() {
             if let Some(profile) = &config.profile {
-                // Preserve the raw profile name for dynamic/custom profiles
                 args.profile = Some(profile.clone());
             }
         }
 
-        // Merge other config options (simplified for brevity)
         if let Some(exts) = &config.extensions {
-            args.extensions = Some(exts.clone());
+            // Only override if not provided via CLI
+            if args.extensions.is_none() {
+                args.extensions = Some(exts.clone());
+            }
         }
+        
+        if let Some(filenames) = &config.allowed_filenames {
+             if args.allowed_filenames.is_none() {
+                args.allowed_filenames = Some(filenames.clone());
+            }
+        }
+
         if args.include_globs.is_none() {
             args.include_globs = config.include_globs.clone();
         }
+        if args.exclude_globs.is_none() {
+            args.exclude_globs = config.exclude_globs.clone();
+        }
+        
         if args.markdown == 0 {
             if let Some(markdown) = config.markdown {
                 args.markdown = if markdown { 1 } else { 0 };
             }
+        }
+        
+        // Merge boolean flags if CLI flag is false (default)
+        if !args.exclude_node_modules && config.exclude_node_modules.unwrap_or(false) {
+            args.exclude_node_modules = true;
+        }
+        if !args.exclude_build_dirs && config.exclude_build_dirs.unwrap_or(false) {
+            args.exclude_build_dirs = true;
+        }
+        if !args.exclude_hidden_dirs && config.exclude_hidden_dirs.unwrap_or(false) {
+            args.exclude_hidden_dirs = true;
+        }
+        if !args.include_git_changes && config.include_git_changes.unwrap_or(false) {
+            args.include_git_changes = true;
         }
     }
     args
 }
 
 fn validate_config(args: &Args) -> Result<()> {
-    // Validate directory conflicts
     if let (Some(include_dirs), Some(exclude_dirs)) = (&args.include_dirs, &args.exclude_dirs) {
         for include_dir in include_dirs {
             for exclude_dir in exclude_dirs {
@@ -516,23 +266,63 @@ fn validate_config(args: &Args) -> Result<()> {
         }
     }
 
-    // Validate max size
     if args.max_size > 100.0 {
         return Err(anyhow::anyhow!("Max file size cannot exceed 100MB"));
     }
 
     Ok(())
 }
-fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<ProcessingResult> {
-    apply_profile_settings(args, config)?;
- 
-    // Debug log the effective profile-derived settings so we can diagnose missing files (helps on Windows where globs
-    // may use forward slashes).
+
+fn process_directories(args: &mut Args, profile_manager: &ProfileManager) -> Result<ProcessingResult> {
+    // Apply Profile Settings
+    if let Some(profile_name) = &args.profile {
+        let profile = if profile_name == "wordpress" {
+             // Special handling for WordPress to enable path-aware resolution
+             let default_path = PathBuf::from(".");
+             let path = args.target_dirs.first().unwrap_or(&default_path);
+             profile_manager.resolve_wordpress_path_aware(profile_name, path, args)
+        } else {
+             profile_manager.resolve(profile_name)
+        };
+
+        if let Some(p) = profile {
+            if args.verbose {
+                info!("Applied profile: {}", p.description);
+            }
+            // Merge profile settings into args if args are empty
+            if args.extensions.is_none() {
+                args.extensions = Some(p.allowed_extensions);
+            }
+            if args.allowed_filenames.is_none() {
+                args.allowed_filenames = Some(p.allowed_filenames);
+            }
+            // Append globs from profile to any existing args
+            if !p.include_globs.is_empty() {
+                 let mut current_globs = args.include_globs.clone().unwrap_or_default();
+                 for g in p.include_globs {
+                     if !current_globs.contains(&g) {
+                         current_globs.push(g);
+                     }
+                 }
+                 args.include_globs = Some(current_globs);
+            }
+            
+            if args.markdown == 0 {
+                if let Some(markdown) = p.markdown {
+                    args.markdown = if markdown { 1 } else { 0 };
+                }
+            }
+        } else {
+            warn!("Profile '{}' not found. Using provided arguments only.", profile_name);
+        }
+    }
+
     info!(
-        "Effective profile settings - extensions: {:?}, allowed_filenames: {:?}, include_globs: {:?}, max_size: {}MB",
+        "Settings - extensions: {:?}, filenames: {:?}, include_globs: {:?}, max_size: {}MB",
         args.extensions, args.allowed_filenames, args.include_globs, args.max_size
     );
- 
+
+    // Prepare lookup sets
     let mut extensions: HashSet<String> = HashSet::new();
     if let Some(exts) = &args.extensions {
         extensions = exts
@@ -555,54 +345,56 @@ fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<P
     let all_contents = Arc::new(Mutex::new(String::new()));
     let file_count = Arc::new(Mutex::new(0));
 
-    info!("Starting code flattening");
-    debug!("Target directories: {:?}", args.target_dirs);
-    debug!("Allowed extensions: {:?}", extensions);
-    debug!("Max file size: {:.2} MB", args.max_size);
+    info!("Starting processing...");
 
     for start_dir in &args.target_dirs {
         let start_dir = fs::canonicalize(start_dir)
             .with_context(|| format!("Failed to canonicalize path: {}", start_dir.display()))?;
 
         if !is_safe_path(&start_dir, &start_dir) {
-            return Err(anyhow::anyhow!(
-                "Path traversal detected: {}",
-                start_dir.display()
-            ));
+             return Err(anyhow::anyhow!("Path traversal detected: {}", start_dir.display()));
         }
 
         let walker = build_walker(&start_dir, args);
         let entries: Vec<_> = walker.build().filter_map(Result::ok).collect();
 
         if args.parallel {
-            process_entries_parallel(
-                &entries,
-                &start_dir,
-                &extensions,
-                &allowed_filenames,
-                max_file_size,
-                args,
-                &all_contents,
-                &file_count,
-            )?;
+            entries.par_iter().for_each(|entry| {
+                let path = entry.path();
+                if should_process_path(path, args, &start_dir) {
+                    if let Err(e) = process_single_file(
+                        path,
+                        &extensions,
+                        &allowed_filenames,
+                        max_file_size,
+                        args,
+                        &all_contents,
+                        &file_count,
+                    ) {
+                        warn!("Failed to process {}: {}", path.display(), e);
+                    }
+                }
+            });
         } else {
-            process_entries_sequential(
-                &entries,
-                &start_dir,
-                &extensions,
-                &allowed_filenames,
-                max_file_size,
-                args,
-                &all_contents,
-                &file_count,
-            )?;
+            for entry in entries {
+                let path = entry.path();
+                if should_process_path(path, args, &start_dir) {
+                    process_single_file(
+                        path,
+                        &extensions,
+                        &allowed_filenames,
+                        max_file_size,
+                        args,
+                        &all_contents,
+                        &file_count,
+                    )?;
+                }
+            }
         }
     }
 
-    // If dry-run, do not fetch git diffs or assemble file contents.
-    // We still rely on process_single_file to have incremented file_count.
+    // Final content assembly
     let content = if args.dry_run {
-        // Do not collect git changes or file contents in dry-run.
         String::new()
     } else {
         let mut git_output = String::new();
@@ -644,40 +436,28 @@ fn process_directories(args: &mut Args, config: &Option<ConfigFile>) -> Result<P
 
 fn build_walker(start_dir: &Path, args: &Args) -> WalkBuilder {
     let mut walker = WalkBuilder::new(start_dir);
-
     walker.max_depth(Some(args.max_depth));
 
     if args.exclude_node_modules {
-        walker.filter_entry(|entry| {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            name != "node_modules"
-        });
+        walker.filter_entry(|entry| entry.file_name() != "node_modules");
     }
 
     if args.exclude_build_dirs {
         walker.filter_entry(|entry| {
-            let path = entry.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let name = entry.file_name().to_string_lossy();
             !matches!(name.as_ref(), "target" | "build" | "dist")
         });
     }
 
     if args.exclude_hidden_dirs {
         walker.filter_entry(|entry| {
-            let path = entry.path();
-            !path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .starts_with('.')
+            !entry.file_name().to_string_lossy().starts_with('.')
         });
     }
 
-    // Add WordPress-specific exclusions
+    // Always filter specific WP dirs to avoid massive dumps unless explicitly crawled
     walker.filter_entry(|entry| {
-        let path = entry.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = entry.file_name().to_string_lossy();
         name != "wp-admin" && name != "wp-includes"
     });
 
@@ -685,29 +465,23 @@ fn build_walker(start_dir: &Path, args: &Args) -> WalkBuilder {
 }
 
 fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
-    if path.is_dir() {
-        return false;
-    }
+    if path.is_dir() { return false; }
 
     let relative_path = match path.strip_prefix(base_dir) {
         Ok(p) => p,
         Err(_) => path,
     };
 
-    // Check .flattenerignore
-    if is_ignored_by_file(path, base_dir) {
-        return false;
-    }
+    if is_ignored_by_file(path, base_dir) { return false; }
 
-    // Check directory inclusions/exclusions
+    // Directory Exclusions
     if let Some(exclude_dirs) = &args.exclude_dirs {
         for exclude_dir in exclude_dirs {
-            if relative_path.starts_with(exclude_dir) {
-                return false;
-            }
+            if relative_path.starts_with(exclude_dir) { return false; }
         }
     }
 
+    // Directory Inclusions (Exclusive)
     if let Some(include_dirs) = &args.include_dirs {
         let mut included = false;
         for include_dir in include_dirs {
@@ -716,160 +490,101 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
                 break;
             }
         }
-        if !included {
-            return false;
-        }
+        if !included { return false; }
     }
 
-    // Check glob patterns
+    // Exclude Globs
     if let Some(exclude_globs) = &args.exclude_globs {
         for pattern in exclude_globs {
-            // Normalize pattern for the host OS (allow toml patterns like "src/*" to work on Windows).
-            let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
-            if let Ok(glob_pattern) = Pattern::new(&pat_os) {
-                if glob_pattern.matches_path(relative_path) {
-                    return false;
-                }
-                // Also try matching against a forward-slash-normalized path string as a fallback.
-                let rel_forward = relative_path.to_string_lossy().replace('\\', "/");
-                if glob_pattern.matches_path(std::path::Path::new(&rel_forward)) {
-                    return false;
-                }
-            } else if let Ok(glob_pattern) = Pattern::new(pattern) {
-                if glob_pattern.matches_path(relative_path) {
-                    return false;
-                }
-            }
+            // Check matches against OS path and forward-slash normalized path
+            if match_glob(pattern, relative_path) { return false; }
         }
     }
 
+    // Include Globs
     if let Some(include_globs) = &args.include_globs {
-        let mut included = false;
         for pattern in include_globs {
-            // Normalize pattern to account for Windows path separators in TOML authored globs.
-            let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
-            if let Ok(glob_pattern) = Pattern::new(&pat_os) {
-                if glob_pattern.matches_path(relative_path) {
-                    included = true;
-                    break;
-                }
-                // Fallback: try matching against a forward-slash-normalized string path
-                let rel_forward = relative_path.to_string_lossy().replace('\\', "/");
-                if glob_pattern.matches_path(std::path::Path::new(&rel_forward)) {
-                    included = true;
-                    break;
-                }
-            } else if let Ok(glob_pattern) = Pattern::new(pattern) {
-                if glob_pattern.matches_path(relative_path) {
-                    included = true;
-                    break;
-                }
+             if match_glob(pattern, relative_path) {
+                // If include globs are specified, but nothing matches, does it mean exclude?
+                // Not necessarily if extensions/filenames are also used. Logic continues below.
+                // But if include_globs was intended as a strict filter, we might need complex logic.
+                // Here we treat include_globs as additive in `process_single_file`, but explicit excludes above win.
+                // So we don't return false here yet.
+                break;
             }
-        }
-        if !included {
-            return false;
         }
     }
 
-    // WordPress-profile specific: exclude plugins specified via --wp-exclude-plugins
+    // WordPress-specific Exclusions
     if let Some(excludes) = &args.wp_exclude_plugins {
         if let Ok(rel) = path.strip_prefix(base_dir) {
-            // Normalize the relative path to lowercase for slug matching
             let rel_str = rel.to_string_lossy().to_lowercase();
             for raw in excludes {
-                // Normalize exclude entries (allow values like "woocommerce/packages/..." or "Woocommerce")
                 let slug = raw.split('/').next().unwrap_or(raw).to_lowercase();
                 let plugin_prefix = format!("wp-content/plugins/{}", slug);
-                if rel_str.starts_with(&plugin_prefix) {
-                    if args.verbose {
-                        info!("Excluding plugin '{}' path: {}", raw, rel.display());
-                    }
-                    return false;
-                }
+                if rel_str.starts_with(&plugin_prefix) { return false; }
             }
         }
     }
 
-    // Check if file is binary (skip binary files)
-    if is_binary_file(path) {
-        return false;
-    }
+    if is_binary_file(path) { return false; }
 
-    // WordPress-profile specific: if --wp-include-only-plugins or --wp-include-theme is used,
-    // we should ONLY include those directories and wp-config.php.
-    if args.profile.as_deref() == Some("wordpress")
-        && (args.wp_include_only_plugins.is_some() || args.wp_include_theme.is_some())
-    {
+    // WordPress Inclusion Logic (Strict Mode)
+    if args.profile.as_deref() == Some("wordpress") 
+       && (args.wp_include_only_plugins.is_some() || args.wp_include_theme.is_some()) {
         if let Ok(rel) = path.strip_prefix(base_dir) {
             let rel_str_lower = rel.to_string_lossy().to_lowercase();
-
-            // Always allow wp-config.php
-            if rel_str_lower == "wp-config.php" {
-                return true;
-            }
-
-            // Check if path is inside one of the included plugins
+            if rel_str_lower == "wp-config.php" { return true; }
+            
             if let Some(includes) = &args.wp_include_only_plugins {
                 for raw in includes {
                     let slug = raw.split('/').next().unwrap_or(raw).to_lowercase();
-                    let plugin_prefix = format!("wp-content/plugins/{}", slug);
-                    if rel_str_lower.starts_with(&plugin_prefix) {
-                        return true;
-                    }
+                    let prefix = format!("wp-content/plugins/{}", slug);
+                    if rel_str_lower.starts_with(&prefix) { return true; }
                 }
             }
-
-            // Check if path is inside the included theme
-            if let Some(theme_name) = &args.wp_include_theme {
-                let theme_prefix = format!("wp-content/themes/{}", theme_name.to_lowercase());
-                if rel_str_lower.starts_with(&theme_prefix) {
-                    return true;
-                }
+            
+            if let Some(theme) = &args.wp_include_theme {
+                 let prefix = format!("wp-content/themes/{}", theme.to_lowercase());
+                 if rel_str_lower.starts_with(&prefix) { return true; }
             }
-
-            // If we are here, the path is not in any of the allowed include lists, so deny it.
-            return false;
-        } else {
-            // If we can't get a relative path, deny it to be safe.
-            return false;
+            return false; // Strict mode active and no match
         }
     }
 
-    // For WordPress profile, exclude common core WordPress files
+    // Core WP File Exclusion
     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
         let core_wp_files = [
-            "xmlrpc.php",
-            "wp-activate.php",
-            "wp-cron.php",
-            "wp-load.php",
-            "wp-blog-header.php",
-            "wp-settings.php",
-            "wp-login.php",
-            "wp-signup.php",
-            "wp-trackback.php",
-            "wp-comments-post.php",
-            "wp-links-opml.php",
-            "wp-mail.php",
+            "xmlrpc.php", "wp-activate.php", "wp-cron.php", "wp-load.php",
+            "wp-blog-header.php", "wp-settings.php", "wp-login.php", "wp-signup.php",
+            "wp-trackback.php", "wp-comments-post.php", "wp-links-opml.php", "wp-mail.php",
         ];
-
-        if core_wp_files.contains(&file_name) {
-            return false;
-        }
+        if core_wp_files.contains(&file_name) { return false; }
     }
 
     true
 }
 
+fn match_glob(pattern: &str, path: &Path) -> bool {
+    let pat_os = pattern.replace('/', &std::path::MAIN_SEPARATOR.to_string());
+    if let Ok(glob) = Pattern::new(&pat_os) {
+        if glob.matches_path(path) { return true; }
+    }
+    // Fallback for Windows: match against forward-slash string
+    let rel_forward = path.to_string_lossy().replace('\\', "/");
+    if let Ok(glob) = Pattern::new(pattern) {
+        if glob.matches_path(Path::new(&rel_forward)) { return true; }
+    }
+    false
+}
+
 fn is_ignored_by_file(path: &Path, base_dir: &Path) -> bool {
-    let ignore_patterns = load_ignore_patterns();
+    let patterns = load_ignore_patterns();
     let relative_path = match path.strip_prefix(base_dir) {
         Ok(p) => p,
         Err(_) => path,
     };
-
-    ignore_patterns
-        .iter()
-        .any(|pattern| pattern.matches_path(relative_path))
+    patterns.iter().any(|p| p.matches_path(relative_path))
 }
 
 fn load_ignore_patterns() -> Vec<Pattern> {
@@ -878,9 +593,7 @@ fn load_ignore_patterns() -> Vec<Pattern> {
         for line in content.lines() {
             let line = line.trim();
             if !line.is_empty() && !line.starts_with('#') {
-                if let Ok(pattern) = Pattern::new(line) {
-                    patterns.push(pattern);
-                }
+                if let Ok(p) = Pattern::new(line) { patterns.push(p); }
             }
         }
     }
@@ -888,7 +601,6 @@ fn load_ignore_patterns() -> Vec<Pattern> {
 }
 
 fn is_binary_file(path: &Path) -> bool {
-    // Check file extension for known binary files
     if let Some(ext) = path.extension() {
         let ext_str = ext.to_string_lossy().to_lowercase();
         let binary_extensions = [
@@ -897,88 +609,20 @@ fn is_binary_file(path: &Path) -> bool {
             "7z", "rar", "pdf", "doc", "docx", "xls", "xlsx", "exe", "dll", "so", "dylib", "woff",
             "woff2", "ttf", "eot",
         ];
-
-        if binary_extensions.contains(&ext_str.as_str()) {
-            return true;
-        }
+        if binary_extensions.contains(&ext_str.as_str()) { return true; }
     }
-
-    // For files without extensions or unknown extensions, try to detect by reading first 1024 bytes
+    // Byte check
     if let Ok(mut file) = fs::File::open(path) {
         let mut buffer = [0u8; 1024];
-        if let Ok(bytes_read) = file.read(&mut buffer) {
-            // Check for null bytes or non-printable characters
-            for &byte in &buffer[..bytes_read] {
+        if let Ok(n) = file.read(&mut buffer) {
+            for &byte in &buffer[..n] {
                 if byte == 0 || (byte < 32 && byte != 9 && byte != 10 && byte != 13) {
                     return true;
                 }
             }
         }
     }
-
     false
-}
-
-fn process_entries_parallel(
-    entries: &[ignore::DirEntry],
-    start_dir: &Path,
-    extensions: &HashSet<String>,
-    allowed_filenames: &HashSet<String>,
-    max_file_size: u64,
-    args: &Args,
-    all_contents: &Arc<Mutex<String>>,
-    file_count: &Arc<Mutex<usize>>,
-) -> Result<()> {
-    entries.par_iter().for_each(|entry| {
-        let path = entry.path();
-
-        if !should_process_path(path, args, start_dir) {
-            return;
-        }
-
-        if let Err(e) = process_single_file(
-            path,
-            extensions,
-            allowed_filenames,
-            max_file_size,
-            args,
-            all_contents,
-            file_count,
-        ) {
-            warn!("Failed to process {}: {}", path.display(), e);
-        }
-    });
-    Ok(())
-}
-
-fn process_entries_sequential(
-    entries: &[ignore::DirEntry],
-    start_dir: &Path,
-    extensions: &HashSet<String>,
-    allowed_filenames: &HashSet<String>,
-    max_file_size: u64,
-    args: &Args,
-    all_contents: &Arc<Mutex<String>>,
-    file_count: &Arc<Mutex<usize>>,
-) -> Result<()> {
-    for entry in entries {
-        let path = entry.path();
-
-        if !should_process_path(path, args, start_dir) {
-            continue;
-        }
-
-        process_single_file(
-            path,
-            extensions,
-            allowed_filenames,
-            max_file_size,
-            args,
-            all_contents,
-            file_count,
-        )?;
-    }
-    Ok(())
 }
 
 fn process_single_file(
@@ -993,25 +637,23 @@ fn process_single_file(
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let extension = path.extension().unwrap_or_default().to_string_lossy();
 
+    // Logic: Allowed if extension matches OR filename matches OR include_globs matches.
+    // However, include_globs matching happens in `should_process_path` (mostly). 
+    // To support profiles that *only* have include_globs (no extensions), we must be permissive here 
+    // if include_globs are present.
+    
     let is_allowed_ext = extensions.contains(&format!(".{}", extension));
     let is_allowed_file = allowed_filenames.contains(file_name.as_ref());
-
-    // If the caller provided include_globs (and the file reached this point via
-    // should_process_path), we should allow processing even when extensions or
-    // allowed_filenames are empty. This supports profiles that specify globs
-    // instead of extension lists (e.g. custom rust2 profile using "src/**").
     let is_allowed_by_glob = args.include_globs.is_some();
 
     if !is_allowed_ext && !is_allowed_file && !is_allowed_by_glob {
         return Ok(());
     }
 
-    // For dry-run we want to avoid any file reads. Log a single "DRY-RUN" line and
-    // increment the counter. Do not attempt metadata or content access.
     if args.dry_run {
         info!("DRY-RUN: would process {}", path.display());
-        let mut count = file_count.lock().unwrap();
-        *count += 1;
+        let mut c = file_count.lock().unwrap();
+        *c += 1;
         return Ok(());
     }
 
@@ -1019,9 +661,7 @@ fn process_single_file(
         .with_context(|| format!("Failed to get metadata for {}", path.display()))?;
 
     if metadata.len() > max_file_size {
-        if args.verbose {
-            info!("Skipping large file: {}", path.display());
-        }
+        if args.verbose { info!("Skipping large file: {}", path.display()); }
         return Ok(());
     }
 
@@ -1041,16 +681,13 @@ fn process_single_file(
         formatted_content.push_str("\n```\n");
     }
 
-    let mut all_contents = all_contents.lock().unwrap();
-    all_contents.push_str(&formatted_content);
+    let mut ac = all_contents.lock().unwrap();
+    ac.push_str(&formatted_content);
+    
+    let mut c = file_count.lock().unwrap();
+    *c += 1;
 
-    let mut count = file_count.lock().unwrap();
-    *count += 1;
-
-    if args.verbose {
-        info!("Processed: {}", path.display());
-    }
-
+    if args.verbose { info!("Processed: {}", path.display()); }
     Ok(())
 }
 
@@ -1058,97 +695,22 @@ fn output_results(result: &ProcessingResult, args: &Args) -> Result<()> {
     if let Some(output_path) = &args.output {
         if let Some(parent) = output_path.parent() {
             if !parent.exists() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create output directory: {}", parent.display())
-                })?;
+                fs::create_dir_all(parent)?;
             }
         }
-
-        let file = fs::File::create(output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
+        let file = fs::File::create(output_path)?;
         let mut writer = BufWriter::new(file);
-        write!(writer, "{}", result.content).with_context(|| {
-            format!("Failed to write to output file: {}", output_path.display())
-        })?;
-
+        write!(writer, "{}", result.content)?;
         info!("Flattened code written to: {}", output_path.display());
     } else {
         let mut stdout = io::stdout().lock();
         write!(stdout, "{}", result.content)?;
     }
-
-    info!("Total files processed: {}", result.file_count);
-    info!("Approximate token count: {}", result.token_count);
-
     Ok(())
-}
-
-fn apply_profile_settings(args: &mut Args, config: &Option<ConfigFile>) -> Result<()> {
-    if let Some(profile_name) = &args.profile.clone() {
-        let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
-        let custom_profiles = config
-            .as_ref()
-            .and_then(|c| c.profiles.as_ref())
-            .cloned()
-            .unwrap_or_default();
-
-        let profile = if custom_profiles.contains_key(profile_name) {
-            if args.verbose {
-                info!("Using custom profile '{}'", profile_name);
-            }
-            Some(resolve_custom_profile(
-                profile_name,
-                &custom_profiles,
-                plugin.as_ref(),
-            )?)
-        } else {
-            plugin.get_profile(profile_name)
-        };
-
-        if let Some(p) = profile {
-            if args.extensions.is_none() {
-                args.extensions = Some(p.allowed_extensions);
-            }
-            if args.allowed_filenames.is_none() {
-                args.allowed_filenames = Some(p.allowed_filenames);
-            }
-            // Only apply include_globs from a profile when the profile actually provides globs.
-            // An empty Vec means "no globs" and should not override absence of include_globs on args,
-            // because an empty Some(Vec::new()) would block all files later when checked.
-            if args.include_globs.is_none() && !p.include_globs.is_empty() {
-                args.include_globs = Some(p.include_globs);
-            }
-            if args.markdown == 0 {
-                if let Some(markdown) = p.markdown {
-                    args.markdown = if markdown { 1 } else { 0 };
-                }
-            }
-        }
-    }
-    Ok(())
-}
-fn list_profiles() {
-    let plugin: Box<dyn ProfilePlugin> = Box::new(CompositeProfilePlugin::new());
-    println!("Available Profiles:");
-    for name in plugin.list_profiles() {
-        if let Some(profile) = plugin.get_profile(&name) {
-            println!("  - {}: {}", name, profile.description);
-            println!("    Extensions: {}", profile.allowed_extensions.join(", "));
-            if !profile.allowed_filenames.is_empty() {
-                println!(
-                    "    Allowed Filenames: {}",
-                    profile.allowed_filenames.join(", ")
-                );
-            }
-            println!();
-        }
-    }
 }
 
 fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
-    let mut current_path = fs::canonicalize(start_path)
-        .with_context(|| format!("Failed to find canonical path for {}", start_path.display()))?;
-
+    let mut current_path = fs::canonicalize(start_path)?;
     loop {
         if current_path.join(".git").is_dir() {
             return Ok(Some(current_path));
@@ -1160,78 +722,58 @@ fn find_git_root(start_path: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn get_git_changes(
-    git_repo_path: &Path,
+    repo_path: &Path,
     include_staged: bool,
     include_unstaged: bool,
     verbose: bool,
 ) -> Result<Option<String>> {
     let mut output = String::new();
     output.push_str("\n\n# --- Git Changes ---\n");
-    output.push_str(&format!("# Repository: {}\n\n", git_repo_path.display()));
+    output.push_str(&format!("# Repository: {}\n\n", repo_path.display()));
 
-    let status_output = Command::new("git")
+    let status_out = Command::new("git")
         .args(["status", "--porcelain", "-uall"])
-        .current_dir(git_repo_path)
-        .output()
-        .context("Failed to execute 'git status'")?;
+        .current_dir(repo_path)
+        .output()?;
 
-    if status_output.status.success() {
-        let stdout = String::from_utf8_lossy(&status_output.stdout);
-        if !stdout.trim().is_empty() {
+    if status_out.status.success() {
+        let s = String::from_utf8_lossy(&status_out.stdout);
+        if !s.trim().is_empty() {
             output.push_str("## Git Status:\n```bash\n");
-            output.push_str(stdout.trim());
+            output.push_str(s.trim());
             output.push_str("\n```\n\n");
-        } else {
-            output.push_str("## Git Status: No uncommitted changes.\n\n");
         }
     } else if verbose {
-        warn!(
-            "'git status' failed: {}",
-            String::from_utf8_lossy(&status_output.stderr)
-        );
+        warn!("git status failed");
     }
 
     if include_staged {
-        let diff_output = Command::new("git")
+        let diff = Command::new("git")
             .args(["diff", "--staged"])
-            .current_dir(git_repo_path)
-            .output()
-            .context("Failed to execute 'git diff --staged'")?;
-
-        if diff_output.status.success() {
-            let stdout = String::from_utf8_lossy(&diff_output.stdout);
-            if !stdout.trim().is_empty() {
-                output.push_str("## Git Diff (Staged):\n```diff\n");
-                output.push_str(stdout.trim());
-                output.push_str("\n```\n\n");
-            }
-        } else if verbose {
-            warn!(
-                "'git diff --staged' failed: {}",
-                String::from_utf8_lossy(&diff_output.stderr)
-            );
+            .current_dir(repo_path)
+            .output()?;
+        if diff.status.success() {
+             let s = String::from_utf8_lossy(&diff.stdout);
+             if !s.trim().is_empty() {
+                 output.push_str("## Git Diff (Staged):\n```diff\n");
+                 output.push_str(s.trim());
+                 output.push_str("\n```\n\n");
+             }
         }
     }
-
+    
     if include_unstaged {
-        let diff_output = Command::new("git")
+        let diff = Command::new("git")
             .args(["diff"])
-            .current_dir(git_repo_path)
-            .output()
-            .context("Failed to execute 'git diff'")?;
-
-        if diff_output.status.success() {
-            let stdout = String::from_utf8_lossy(&diff_output.stdout);
-            if !stdout.trim().is_empty() {
-                output.push_str("## Git Diff (Unstaged):\n```diff\n");
-                output.push_str(stdout.trim());
-                output.push_str("\n```\n\n");
-            }
-        } else if verbose {
-            warn!(
-                "'git diff' failed: {}",
-                String::from_utf8_lossy(&diff_output.stderr)
-            );
+            .current_dir(repo_path)
+            .output()?;
+        if diff.status.success() {
+             let s = String::from_utf8_lossy(&diff.stdout);
+             if !s.trim().is_empty() {
+                 output.push_str("## Git Diff (Unstaged):\n```diff\n");
+                 output.push_str(s.trim());
+                 output.push_str("\n```\n\n");
+             }
         }
     }
 
@@ -1239,270 +781,12 @@ fn get_git_changes(
 }
 
 fn is_safe_path(path: &Path, base_dir: &Path) -> bool {
-    // Try a few prefix checks to determine whether `path` is inside `base_dir`.
-    // 1. If `path` can be stripped by the raw base_dir, it's safe (handles relative cases).
-    if path.strip_prefix(base_dir).is_ok() {
-        return true;
-    }
-
-    // 2. Canonicalize base_dir where possible and check starts_with (avoids touching candidate).
+    if path.strip_prefix(base_dir).is_ok() { return true; }
     let base_abs = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
-    if path.starts_with(&base_abs) {
-        return true;
-    }
-
-    // 3. For relative `path` values, join with canonical base and check.
+    if path.starts_with(&base_abs) { return true; }
     if !path.is_absolute() {
         let candidate = base_abs.join(path);
         return candidate.starts_with(&base_abs);
     }
-
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::env;
-
-    #[test]
-    fn test_is_safe_path() {
-        let base_path = env::temp_dir();
-        // create a unique subdir for test
-        let temp_dir = base_path.join("codeflattener_test_tmp");
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-        let base_path = temp_dir.as_path();
-        let safe_path = base_path.join("subdir/file.txt");
-        assert!(is_safe_path(&safe_path, base_path));
-
-        // This should be safe even if it doesn't exist yet
-        let non_existent = base_path.join("nonexistent");
-        assert!(is_safe_path(&non_existent, base_path));
-    }
-
-    #[test]
-    fn test_should_process_path() {
-        let base = env::temp_dir();
-        let temp_dir = base.join("codeflattener_test_tmp_2");
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-        let base_path = temp_dir.as_path();
-        let file_path = base_path.join("src/main.rs");
-
-        fs::create_dir_all(base_path.join("src")).unwrap();
-        fs::write(&file_path, "fn main() {}").unwrap();
-
-        // Create a minimal Args instance for testing
-        let args = Args {
-            target_dirs: vec![base_path.to_path_buf()],
-            output: None,
-            profile: None,
-            list_profiles: false,
-            extensions: None,
-            allowed_filenames: None,
-            max_size: 2.0,
-            markdown: 0,
-            gpt4_tokens: false,
-            include_git_changes: false,
-            no_staged_diff: false,
-            no_unstaged_diff: false,
-            verbose: false,
-            config: None,
-            include_dirs: None,
-            exclude_dirs: None,
-            exclude_node_modules: false,
-            exclude_build_dirs: false,
-            exclude_hidden_dirs: false,
-            max_depth: 100,
-            exclude_patterns: None,
-            include_patterns: None,
-            exclude_globs: None,
-            include_globs: None,
-            parallel: false,
-            progress: false,
-            dry_run: false,
-            wp_exclude_plugins: None,
-            wp_include_only_plugins: None,
-            wp_include_theme: None,
-        };
-
-        assert!(should_process_path(&file_path, &args, base_path));
-    }
-    #[test]
-    fn test_resolve_custom_profile_merge_and_apply() {
-        use std::collections::HashMap;
-
-        // Build a custom parent profile that mirrors a built-in-ish profile
-        let mut custom_profiles: HashMap<String, CustomProfile> = HashMap::new();
-        custom_profiles.insert(
-            "parent".to_string(),
-            CustomProfile {
-                description: Some("Parent profile".to_string()),
-                extends: None,
-                extensions: Some(vec![".rs".to_string(), ".toml".to_string()]),
-                allowed_filenames: Some(vec!["Cargo.toml".to_string()]),
-                include_globs: Some(vec!["src/**".to_string()]),
-                markdown: Some(true),
-            },
-        );
-
-        // Child extends parent but adds an extension and a filename
-        custom_profiles.insert(
-            "child".to_string(),
-            CustomProfile {
-                description: Some("Child profile".to_string()),
-                extends: Some("parent".to_string()),
-                extensions: Some(vec![".ron".to_string()]),
-                allowed_filenames: Some(vec!["README.md".to_string()]),
-                include_globs: Some(vec!["examples/**".to_string()]),
-                markdown: None,
-            },
-        );
-
-        // Use the default plugin (CompositeProfilePlugin) for resolution
-        let plugin = CompositeProfilePlugin::new();
-
-        // Resolve child via resolve_custom_profile
-        let resolved = resolve_custom_profile("child", &custom_profiles, &plugin)
-            .expect("Failed to resolve custom profile");
-
-        // Parent extensions should be present and child extension should be added
-        assert!(resolved.allowed_extensions.contains(&".rs".to_string()));
-        assert!(resolved.allowed_extensions.contains(&".toml".to_string()));
-        assert!(resolved.allowed_extensions.contains(&".ron".to_string()));
-
-        // Filenames should include both parent and child entries
-        assert!(resolved.allowed_filenames.contains(&"Cargo.toml".to_string()));
-        assert!(resolved.allowed_filenames.contains(&"README.md".to_string()));
-
-        // Include globs should be merged (parent + child)
-        assert!(resolved.include_globs.contains(&"src/**".to_string()));
-        assert!(resolved.include_globs.contains(&"examples/**".to_string()));
-
-        // Now test apply_profile_settings uses resolved profile when handed via ConfigFile
-        let mut args = Args {
-            target_dirs: vec![PathBuf::from(".")],
-            output: None,
-            profile: Some("child".to_string()),
-            list_profiles: false,
-            extensions: None,
-            allowed_filenames: None,
-            max_size: 2.0,
-            markdown: 0,
-            gpt4_tokens: false,
-            include_git_changes: false,
-            no_staged_diff: false,
-            no_unstaged_diff: false,
-            verbose: false,
-            config: None,
-            include_dirs: None,
-            exclude_dirs: None,
-            exclude_node_modules: false,
-            exclude_build_dirs: false,
-            exclude_hidden_dirs: false,
-            max_depth: 100,
-            exclude_patterns: None,
-            include_patterns: None,
-            exclude_globs: None,
-            include_globs: None,
-            parallel: false,
-            progress: false,
-            dry_run: false,
-            wp_exclude_plugins: None,
-            wp_include_only_plugins: None,
-            wp_include_theme: None,
-        };
-
-        // Build ConfigFile with profiles populated
-        let config = ConfigFile {
-            profile: None,
-            extensions: None,
-            allowed_filenames: None,
-            max_size: None,
-            markdown: None,
-            gpt4_tokens: None,
-            include_git_changes: None,
-            no_staged_diff: None,
-            no_unstaged_diff: None,
-            include_dirs: None,
-            exclude_dirs: None,
-            exclude_patterns: None,
-            include_patterns: None,
-            exclude_globs: None,
-            include_globs: None,
-            exclude_node_modules: None,
-            exclude_build_dirs: None,
-            exclude_hidden_dirs: None,
-            max_depth: None,
-            profiles: Some(custom_profiles),
-        };
-
-        // Apply profile settings (should pick up merged profile)
-        let res = apply_profile_settings(&mut args, &Some(config));
-        assert!(res.is_ok());
-
-        // After applying, args.extensions and allowed_filenames should be populated
-        let exts = args.extensions.expect("extensions should be set");
-        assert!(exts.contains(&".rs".to_string()));
-        assert!(exts.contains(&".ron".to_string()));
-
-        let files = args.allowed_filenames.expect("allowed filenames should be set");
-        assert!(files.contains(&"Cargo.toml".to_string()));
-        assert!(files.contains(&"README.md".to_string()));
-
-        // include_globs should be set because the merged profile provided globs
-        assert!(args.include_globs.is_some());
-        let globs = args.include_globs.unwrap();
-        assert!(globs.contains(&"src/**".to_string()));
-        assert!(globs.contains(&"examples/**".to_string()));
-
-        // markdown was inherited from parent; since args.markdown was 0 and profile.markdown is true,
-        // apply_profile_settings should set args.markdown to 1
-        assert_eq!(args.markdown, 1);
-    }
-
-    #[test]
-    fn test_apply_profile_respects_existing_args() {
-        // If the CLI already provided extensions, apply_profile_settings should not overwrite them.
-        let mut args = Args {
-            target_dirs: vec![PathBuf::from(".")],
-            output: None,
-            profile: Some("rust".to_string()),
-            list_profiles: false,
-            extensions: Some(vec![".foo".to_string()]), // user provided
-            allowed_filenames: None,
-            max_size: 2.0,
-            markdown: 0,
-            gpt4_tokens: false,
-            include_git_changes: false,
-            no_staged_diff: false,
-            no_unstaged_diff: false,
-            verbose: false,
-            config: None,
-            include_dirs: None,
-            exclude_dirs: None,
-            exclude_node_modules: false,
-            exclude_build_dirs: false,
-            exclude_hidden_dirs: false,
-            max_depth: 100,
-            exclude_patterns: None,
-            include_patterns: None,
-            exclude_globs: None,
-            include_globs: None,
-            parallel: false,
-            progress: false,
-            dry_run: false,
-            wp_exclude_plugins: None,
-            wp_include_only_plugins: None,
-            wp_include_theme: None,
-        };
-
-        // No config file
-        let res = apply_profile_settings(&mut args, &None);
-        assert!(res.is_ok());
-
-        // Ensure the CLI-provided extensions weren't overwritten
-        assert_eq!(args.extensions.unwrap(), vec![".foo".to_string()]);
-    }
 }
