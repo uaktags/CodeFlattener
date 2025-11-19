@@ -312,6 +312,68 @@ fn process_directories(args: &mut Args, profile_manager: &ProfileManager) -> Res
                     args.markdown = if markdown { 1 } else { 0 };
                 }
             }
+
+            // Merge additional profile settings
+            if args.max_size == 0.0 {
+                if let Some(max_size) = p.max_size {
+                    args.max_size = max_size;
+                }
+            }
+            if !args.gpt4_tokens {
+                if let Some(gpt4_tokens) = p.gpt4_tokens {
+                    args.gpt4_tokens = gpt4_tokens;
+                }
+            }
+            if !args.include_git_changes {
+                if let Some(include_git_changes) = p.include_git_changes {
+                    args.include_git_changes = include_git_changes;
+                }
+            }
+            if !args.no_staged_diff {
+                if let Some(no_staged_diff) = p.no_staged_diff {
+                    args.no_staged_diff = no_staged_diff;
+                }
+            }
+            if !args.no_unstaged_diff {
+                if let Some(no_unstaged_diff) = p.no_unstaged_diff {
+                    args.no_unstaged_diff = no_unstaged_diff;
+                }
+            }
+            if args.include_dirs.is_none() {
+                args.include_dirs = p.include_dirs.clone();
+            }
+            if args.exclude_dirs.is_none() {
+                args.exclude_dirs = p.exclude_dirs.clone();
+            }
+            if args.exclude_patterns.is_none() {
+                args.exclude_patterns = p.exclude_patterns.clone();
+            }
+            if args.include_patterns.is_none() {
+                args.include_patterns = p.include_patterns.clone();
+            }
+            if args.exclude_globs.is_none() {
+                args.exclude_globs = p.exclude_globs.clone();
+            }
+            if !args.exclude_node_modules {
+                if let Some(exclude_node_modules) = p.exclude_node_modules {
+                    args.exclude_node_modules = exclude_node_modules;
+                }
+            }
+            if !args.exclude_build_dirs {
+                if let Some(exclude_build_dirs) = p.exclude_build_dirs {
+                    args.exclude_build_dirs = exclude_build_dirs;
+                }
+            }
+            if !args.exclude_hidden_dirs {
+                if let Some(exclude_hidden_dirs) = p.exclude_hidden_dirs {
+                    args.exclude_hidden_dirs = exclude_hidden_dirs;
+                }
+            }
+            if args.max_depth == 0 {
+                if let Some(max_depth) = p.max_depth {
+                    args.max_depth = max_depth;
+                }
+            }
         } else {
             warn!("Profile '{}' not found. Using provided arguments only.", profile_name);
         }
@@ -503,15 +565,15 @@ fn should_process_path(path: &Path, args: &Args, base_dir: &Path) -> bool {
 
     // Include Globs
     if let Some(include_globs) = &args.include_globs {
+        let mut matches = false;
         for pattern in include_globs {
              if match_glob(pattern, relative_path) {
-                // If include globs are specified, but nothing matches, does it mean exclude?
-                // Not necessarily if extensions/filenames are also used. Logic continues below.
-                // But if include_globs was intended as a strict filter, we might need complex logic.
-                // Here we treat include_globs as additive in `process_single_file`, but explicit excludes above win.
-                // So we don't return false here yet.
+                matches = true;
                 break;
             }
+        }
+        if !matches {
+            return false;
         }
     }
 

@@ -6,34 +6,6 @@ include_globs = ["src/**", "Cargo.toml", "Cargo.lock"]
 max_size = 1.0
 gpt4_tokens = true
 
-[profiles.battle-system]
-description = "Profile for the battle system in the Next.js project"
-# Use leading dots for extensions for clarity and consistency with the tool's normalization.
-extensions = [".tsx", ".css", ".js"]
-include_globs = [
-    "src/pages/_app.tsx",
-    "src/components/Layout.tsx",
-    "src/components/MainArea.tsx",
-    "src/components/navLoggedOut.tsx",
-    "src/components/navLoggedIn.tsx",
-    "src/components/Sidebar.tsx",
-    "src/components/NavSkeleton.tsx",
-    "src/components/MainAreaSkeleton.tsx",
-    "src/components/SidebarSkeleton.tsx",
-    "src/pages/index.tsx",
-    "src/pages/home/overview.tsx",
-    "src/components/news-bulletin.tsx",
-    "src/components/ContentCard.tsx",
-    "src/components/RpgAwesomeIcon.tsx",
-    "src/components/loading-dots.tsx",
-    "src/styles/global.css",
-    "tailwind.config.js",
-    "postcss.config.js",
-]
-# Example: exclude tests and build artifacts for this profile
-# exclude_globs = ["**/*.spec.*", "**/*.test.*", "**/dist/**", "**/build/**"]
-markdown = true
-
 [profiles.gold-standard]
 description = "Gold-standard, highly-customized example profile demonstrating available options and a Rust-focused setup."
 profile = "rust" # extends the built-in 'rust' profile so we inherit .rs/.toml defaults
@@ -41,3 +13,4 @@ extensions = [".rs", ".toml", ".md", ".yml", ".yaml", ".json", ".ron", ".lock"]
 allowed_filenames = ["Cargo.toml", "Cargo.lock", "build.rs", ".rustfmt.toml", "README.md"]
 include_globs = ["src/**", "examples/**", "benches/**", "tests/**", "Cargo.toml", "Cargo.lock", "build.rs"]
 markdown = true
+gpt4-tokens = true

@@ -40,16 +40,38 @@ pub struct CustomProfile {
     pub extends: Option<String>,
     pub extensions: Option<Vec<String>>,
     pub allowed_filenames: Option<Vec<String>>,
-    pub include_globs: Option<Vec<String>>,
+    pub max_size: Option<f64>,
     pub markdown: Option<bool>,
+    pub gpt4_tokens: Option<bool>,
+    pub include_git_changes: Option<bool>,
+    pub no_staged_diff: Option<bool>,
+    pub no_unstaged_diff: Option<bool>,
+    pub include_dirs: Option<Vec<PathBuf>>,
+    pub exclude_dirs: Option<Vec<PathBuf>>,
+    pub exclude_patterns: Option<Vec<String>>,
+    pub include_patterns: Option<Vec<String>>,
+    pub exclude_globs: Option<Vec<String>>,
+    pub include_globs: Option<Vec<String>>,
+    pub exclude_node_modules: Option<bool>,
+    pub exclude_build_dirs: Option<bool>,
+    pub exclude_hidden_dirs: Option<bool>,
+    pub max_depth: Option<usize>,
 }
 
-/// Loads the configuration file from the given path or defaults to .flattener.toml
+/// Loads the configuration file from the given path or defaults to .flattener.toml or flattener.toml
 pub fn load_config(config_path: &Option<PathBuf>) -> Result<Option<ConfigFile>> {
     let path = config_path
         .as_ref()
         .cloned()
-        .unwrap_or_else(|| PathBuf::from(".flattener.toml"));
+        .unwrap_or_else(|| {
+            // Try .flattener.toml first, then flattener.toml
+            let dot_path = PathBuf::from(".flattener.toml");
+            if dot_path.exists() {
+                dot_path
+            } else {
+                PathBuf::from("flattener.toml")
+            }
+        });
 
     if path.exists() {
         let content = fs::read_to_string(&path)

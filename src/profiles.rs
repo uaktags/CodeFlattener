@@ -2,6 +2,7 @@ use crate::config::CustomProfile;
 use crate::wordpress_profile::WordPressProfilePlugin;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tracing::debug;
 
 /// Core struct representing a fully resolved profile.
@@ -12,6 +13,20 @@ pub struct Profile {
     pub allowed_filenames: Vec<String>,
     pub include_globs: Vec<String>,
     pub markdown: Option<bool>,
+    pub max_size: Option<f64>,
+    pub gpt4_tokens: Option<bool>,
+    pub include_git_changes: Option<bool>,
+    pub no_staged_diff: Option<bool>,
+    pub no_unstaged_diff: Option<bool>,
+    pub include_dirs: Option<Vec<PathBuf>>,
+    pub exclude_dirs: Option<Vec<PathBuf>>,
+    pub exclude_patterns: Option<Vec<String>>,
+    pub include_patterns: Option<Vec<String>>,
+    pub exclude_globs: Option<Vec<String>>,
+    pub exclude_node_modules: Option<bool>,
+    pub exclude_build_dirs: Option<bool>,
+    pub exclude_hidden_dirs: Option<bool>,
+    pub max_depth: Option<usize>,
 }
 
 impl Profile {
@@ -26,6 +41,20 @@ impl Profile {
             allowed_filenames,
             include_globs: Vec::new(),
             markdown: None,
+            max_size: None,
+            gpt4_tokens: None,
+            include_git_changes: None,
+            no_staged_diff: None,
+            no_unstaged_diff: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            exclude_node_modules: None,
+            exclude_build_dirs: None,
+            exclude_hidden_dirs: None,
+            max_depth: None,
         }
     }
 
@@ -60,6 +89,20 @@ impl Profile {
             allowed_filenames: merged_filenames,
             include_globs: merged_globs,
             markdown: child.markdown.or(self.markdown),
+            max_size: child.max_size.or(self.max_size),
+            gpt4_tokens: child.gpt4_tokens.or(self.gpt4_tokens),
+            include_git_changes: child.include_git_changes.or(self.include_git_changes),
+            no_staged_diff: child.no_staged_diff.or(self.no_staged_diff),
+            no_unstaged_diff: child.no_unstaged_diff.or(self.no_unstaged_diff),
+            include_dirs: child.include_dirs.clone().or(self.include_dirs.clone()),
+            exclude_dirs: child.exclude_dirs.clone().or(self.exclude_dirs.clone()),
+            exclude_patterns: child.exclude_patterns.clone().or(self.exclude_patterns.clone()),
+            include_patterns: child.include_patterns.clone().or(self.include_patterns.clone()),
+            exclude_globs: child.exclude_globs.clone().or(self.exclude_globs.clone()),
+            exclude_node_modules: child.exclude_node_modules.or(self.exclude_node_modules),
+            exclude_build_dirs: child.exclude_build_dirs.or(self.exclude_build_dirs),
+            exclude_hidden_dirs: child.exclude_hidden_dirs.or(self.exclude_hidden_dirs),
+            max_depth: child.max_depth.or(self.max_depth),
         }
     }
 }
@@ -143,6 +186,20 @@ impl ProfileManager {
         );
         child.include_globs = custom.include_globs.clone().unwrap_or_default();
         child.markdown = custom.markdown;
+        child.max_size = custom.max_size;
+        child.gpt4_tokens = custom.gpt4_tokens;
+        child.include_git_changes = custom.include_git_changes;
+        child.no_staged_diff = custom.no_staged_diff;
+        child.no_unstaged_diff = custom.no_unstaged_diff;
+        child.include_dirs = custom.include_dirs.clone();
+        child.exclude_dirs = custom.exclude_dirs.clone();
+        child.exclude_patterns = custom.exclude_patterns.clone();
+        child.include_patterns = custom.include_patterns.clone();
+        child.exclude_globs = custom.exclude_globs.clone();
+        child.exclude_node_modules = custom.exclude_node_modules;
+        child.exclude_build_dirs = custom.exclude_build_dirs;
+        child.exclude_hidden_dirs = custom.exclude_hidden_dirs;
+        child.max_depth = custom.max_depth;
 
         // If it extends something, resolve the parent and merge
         if let Some(parent_name) = &custom.extends {
@@ -201,6 +258,20 @@ static BUILT_IN_PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
             ],
             include_globs: Vec::new(),
             markdown: None,
+            max_size: None,
+            gpt4_tokens: None,
+            include_git_changes: None,
+            no_staged_diff: None,
+            no_unstaged_diff: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            exclude_node_modules: None,
+            exclude_build_dirs: None,
+            exclude_hidden_dirs: None,
+            max_depth: None,
         },
     );
     m.insert(
@@ -214,6 +285,20 @@ static BUILT_IN_PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
             allowed_filenames: vec!["CMakeLists.txt".to_string()],
             include_globs: Vec::new(),
             markdown: None,
+            max_size: None,
+            gpt4_tokens: None,
+            include_git_changes: None,
+            no_staged_diff: None,
+            no_unstaged_diff: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            exclude_node_modules: None,
+            exclude_build_dirs: None,
+            exclude_hidden_dirs: None,
+            max_depth: None,
         },
     );
     m.insert(
@@ -226,6 +311,20 @@ static BUILT_IN_PROFILES: Lazy<HashMap<&'static str, Profile>> = Lazy::new(|| {
             allowed_filenames: vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()],
             include_globs: Vec::new(),
             markdown: None,
+            max_size: None,
+            gpt4_tokens: None,
+            include_git_changes: None,
+            no_staged_diff: None,
+            no_unstaged_diff: None,
+            include_dirs: None,
+            exclude_dirs: None,
+            exclude_patterns: None,
+            include_patterns: None,
+            exclude_globs: None,
+            exclude_node_modules: None,
+            exclude_build_dirs: None,
+            exclude_hidden_dirs: None,
+            max_depth: None,
         },
     );
     m
